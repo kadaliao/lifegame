@@ -14,6 +14,14 @@ export interface WorldConfig {
   birthSpan: number;
 }
 
+export interface IntelChange {
+  tick: number;
+  botId: string;
+  intelligence: 'rules' | 'llm';
+  model?: string;
+  lead?: boolean;
+}
+
 export interface WorldFlags {
   /** 智能人格在人生阶段结束时写反思（经由引擎节点生效，保证可重放） */
   reflections: boolean;
@@ -54,6 +62,8 @@ export interface WorldStateShape {
   /** 已经按推测落地、等真答案确认的决策 */
   provisionalIds: string[];
   flags: WorldFlags;
+  /** 智能设定的时间线：谁在哪个月起由模型/规则驱动。重放时按原来的时刻生效 */
+  intelChanges: IntelChange[];
   /** 时代包的可变全局状态 */
   eraState: Record<string, unknown>;
   nextId: number;

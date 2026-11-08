@@ -2,7 +2,8 @@ import { create } from 'zustand';
 import type { BotSummary } from '@lifegame/core';
 import { DEFAULT_PROVIDERS, type ProviderConfig, type UsageRecord } from '@lifegame/llm';
 import type { Bot, DecisionNode, WorldConfig, WorldEvent, WorldSummary } from '@lifegame/schema';
-import type { BranchInfo, BrainSettings, MainToWorker, StatSample, WorkerToMain } from './protocol.js';
+import type { BranchInfo, BrainSettings, MainToWorker, SaveFile, StatSample, WorkerToMain } from './protocol.js';
+import { AUTOSAVE_ID, deleteSave, downloadSave, getSave, isSaveFile, listSaves, putSave, type SaveMeta } from './saves.js';
 
 export interface EraInfo {
   id: string;
@@ -89,6 +90,12 @@ interface State {
   brain: BrainSettings;
   world: WorldSettings;
   settingsOpen: boolean;
+  savesOpen: boolean;
+  saves: SaveMeta[];
+  /** 一闪而过的提示 */
+  notice?: string;
+  /** 正在读档 */
+  loading: boolean;
 
   boot(): void;
   send(m: MainToWorker): void;
@@ -109,7 +116,21 @@ interface State {
   setSettingsOpen(v: boolean): void;
   dismissError(i: number): void;
   setIntelligence(botId: string, mode: 'rules' | 'llm', model?: string): void;
+  setSavesOpen(v: boolean): void;
+  refreshSaves(): Promise<void>;
+  saveWorld(name: string, id?: string): Promise<void>;
+  loadSave(id: string): Promise<void>;
+  loadFile(file: SaveFile): void;
+  removeSave(id: string): Promise<void>;
+  exportSave(id: string): Promise<void>;
+  importSave(file: File): Promise<void>;
+  flash(text: string): void;
 }
+
+/** 等 Worker 回传存档 */
+const saveRequests = new Map<string, (f: SaveFile) => void>();
+let lastAutosaveKey = '';
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
 const LS_BRAIN = 'lifegame.brain.v1';
 let brainSaved = false;
@@ -154,6 +175,9 @@ export const useStore = create<State>((set, get) => ({
   brain: loadBrain(),
   world: loadWorld(),
   settingsOpen: false,
+  savesOpen: false,
+  saves: [],
+  loading: false,
 
   boot() {
     if (get().worker) return;
@@ -173,7 +197,15 @@ export const useStore = create<State>((set, get) => ({
         const defaultModel = !brainSaved || !stillValid || brain.defaultModel.startsWith('mock/') ? `${env[0].id}/${env[0].models[0]}` : brain.defaultModel;
         set({ brain: { ...brain, providers, defaultModel } });
       }
-      get().restart();
+      // 有上次的自动存档就接着玩，否则开一个新世界
+      getSave(AUTOSAVE_ID)
+        .then((rec) => {
+          if (rec && isSaveFile(rec.file)) get().loadFile(rec.file);
+          else get().restart();
+        })
+        .catch(() => get().restart());
+      void get().refreshSaves();
+      setInterval(() => void autosave(get), 10_000);
     });
   },
 
@@ -182,7 +214,8 @@ export const useStore = create<State>((set, get) => ({
   restart() {
     const { world, brain } = get();
     displayFloat.clear();
-    set({ branches: {}, activeBranch: 'main', compareBranch: undefined, playing: false, viewTick: undefined, selectedBot: undefined, pendingUser: undefined, thinking: {}, botDetail: undefined, compareDetail: undefined, usage: undefined, userControl: null });
+    lastAutosaveKey = '';
+    set({ branches: {}, activeBranch: 'main', compareBranch: undefined, playing: false, viewTick: undefined, selectedBot: undefined, pendingUser: undefined, thinking: {}, botDetail: undefined, compareDetail: undefined, usage: undefined, userControl: null, loading: false });
     get().send({
       type: 'init',
       config: { seed: world.seed, eraId: 'china-modern', population: world.population, startYear: 1980, endYear: world.endYear, birthSpan: 10 },
@@ -253,7 +286,94 @@ export const useStore = create<State>((set, get) => ({
   setSettingsOpen(v) { set({ settingsOpen: v }); },
   dismissError(i) { set((s) => ({ errors: s.errors.filter((_, j) => j !== i) })); },
   setIntelligence(botId, mode, model) { get().send({ type: 'setIntelligence', botId, mode, model }); },
+
+  setSavesOpen(v) {
+    set({ savesOpen: v });
+    if (v) void get().refreshSaves();
+  },
+
+  async refreshSaves() {
+    try { set({ saves: await listSaves() }); } catch { /* IndexedDB 不可用时没有存档功能 */ }
+  },
+
+  async saveWorld(name, id) {
+    const file = await requestSave(get);
+    if (!file) return;
+    const rec = { id: id ?? `s${Date.now()}`, name, savedAt: file.savedAt, file };
+    await putSave(rec);
+    await get().refreshSaves();
+    if (id !== AUTOSAVE_ID) get().flash(`已存档：${name}（${file.meta.year} 年）`);
+  },
+
+  async loadSave(id) {
+    const rec = await getSave(id);
+    if (!rec || !isSaveFile(rec.file)) { get().flash('存档损坏，读不出来'); return; }
+    get().loadFile(rec.file);
+    set({ savesOpen: false });
+  },
+
+  loadFile(file) {
+    displayFloat.clear();
+    lastAutosaveKey = '';
+    set({
+      branches: {}, activeBranch: file.active, compareBranch: undefined, playing: false, viewTick: undefined, selectedBot: undefined,
+      pendingUser: undefined, thinking: {}, botDetail: undefined, compareDetail: undefined, usage: undefined, userControl: null, loading: true,
+    });
+    get().send({ type: 'load', file, brain: { ...get().brain, level: file.flags.reflections ? 2 : file.flags.inherit ? 1 : 0 } });
+  },
+
+  async removeSave(id) {
+    await deleteSave(id);
+    await get().refreshSaves();
+  },
+
+  async exportSave(id) {
+    const rec = await getSave(id);
+    if (rec) downloadSave(rec);
+  },
+
+  async importSave(f) {
+    try {
+      const file = JSON.parse(await f.text()) as unknown;
+      if (!isSaveFile(file)) { get().flash('这不是人生游戏的存档文件'); return; }
+      const name = f.name.replace(/\.json$/i, '');
+      await putSave({ id: `s${Date.now()}`, name, savedAt: file.savedAt, file });
+      await get().refreshSaves();
+      get().flash(`已导入：${name}`);
+    } catch {
+      get().flash('存档文件读不出来');
+    }
+  },
+
+  flash(text) {
+    set({ notice: text });
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => set({ notice: undefined }), 3500);
+  },
 }));
+
+function requestSave(get: () => State): Promise<SaveFile | undefined> {
+  const { worker, branches } = get();
+  if (!worker || !Object.keys(branches).length) return Promise.resolve(undefined);
+  const requestId = `r${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { saveRequests.delete(requestId); resolve(undefined); }, 10_000);
+    saveRequests.set(requestId, (f) => { clearTimeout(timer); resolve(f); });
+    worker.postMessage({ type: 'save', requestId } satisfies MainToWorker);
+  });
+}
+
+/** 画面有变化才自动存一次 */
+async function autosave(get: () => State): Promise<void> {
+  const s = get();
+  if (s.loading) return;
+  const br = s.branches[s.activeBranch];
+  if (!br || br.displayTick === 0) return;
+  const key = `${Object.keys(s.branches).join(',')}|${Object.values(s.branches).map((b) => b.displayTick).join(',')}|${s.activeBranch}`;
+  if (key === lastAutosaveKey) return;
+  lastAutosaveKey = key;
+  try { await s.saveWorld('自动存档', AUTOSAVE_ID); } catch { /* 存不了就算了 */ }
+}
 
 type Set = (fn: Partial<State> | ((s: State) => Partial<State>)) => void;
 type Get = () => State;
@@ -265,7 +385,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       for (const b of m.bots) bots[b.id] = b;
       set({
         config: m.config, era: m.era,
-        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: { 0: frameOf(m.bots, 0) }, displayTick: 0, epoch: 0, frontier: 0 } },
+        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: m.display ? {} : { 0: frameOf(m.bots, 0) }, displayTick: m.display ?? 0, epoch: 0, frontier: m.display ?? 0 } },
         activeBranch: m.branch.id,
       });
       const hero = m.bots.find((b) => b.intelligence === 'llm') ?? m.bots[0];
@@ -339,7 +459,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         const frames: Record<number, Record<string, number>> = {};
         if (parent) for (const [k, f] of Object.entries(parent.frames)) if (Number(k) <= snapTick) frames[Number(k)] = f;
         return {
-          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: parent?.displayTick ?? 0, epoch: 0, frontier: 0 } },
+          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: m.display ?? parent?.displayTick ?? 0, epoch: 0, frontier: m.display ?? 0 } },
           activeBranch: m.branch.id,
           compareBranch: m.branch.parentId,
           viewTick: undefined,
@@ -367,6 +487,28 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       break;
     }
     case 'usage': set({ usage: m.usage, queue: m.queue }); break;
+    case 'frames': {
+      set((s) => {
+        const br = s.branches[m.branchId];
+        if (!br) return {};
+        return { branches: { ...s.branches, [m.branchId]: { ...br, frames: { ...br.frames, ...m.frames } } } };
+      });
+      break;
+    }
+    case 'saved': {
+      saveRequests.get(m.requestId)?.(m.file);
+      saveRequests.delete(m.requestId);
+      break;
+    }
+    case 'loaded': {
+      for (const [id, br] of Object.entries(get().branches)) displayFloat.set(id, br.displayTick);
+      set({ activeBranch: m.active, compareBranch: m.compare, loading: false });
+      const br = get().branches[m.active];
+      const hero = br && (br.botOrder.map((id) => br.bots[id]).find((b) => b.lead) ?? br.bots[br.botOrder[0]]);
+      if (hero) get().selectBot(hero.id);
+      get().flash(`已回到 ${m.year} 年`);
+      break;
+    }
     case 'error': set((s) => ({ errors: [...s.errors.slice(-4), m.message] })); break;
   }
 }

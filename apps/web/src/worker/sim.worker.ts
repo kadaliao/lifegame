@@ -9,7 +9,7 @@ import { World, summarize, type BotSummary } from '@lifegame/core';
 import { getEra } from '@lifegame/eras';
 import { Brain, Director, createProvider, type Provider } from '@lifegame/llm';
 import type { WorldEvent } from '@lifegame/schema';
-import type { BranchInfo, BrainSettings, MainToWorker, StatSample, WorkerToMain } from '../protocol.js';
+import type { BranchInfo, BrainSettings, MainToWorker, SaveFile, SavedBranch, StatSample, WorkerToMain } from '../protocol.js';
 
 interface Branch {
   info: BranchInfo;
@@ -113,6 +113,11 @@ function handle(msg: MainToWorker): void {
       }
       return;
     }
+    case 'save': {
+      post({ type: 'saved', requestId: msg.requestId, file: makeSave() });
+      return;
+    }
+    case 'load': return load(msg.file, msg.brain);
     case 'setActiveBranch': {
       if (branches.has(msg.branchId)) {
         activeId = msg.branchId;
@@ -166,11 +171,15 @@ function makeBranch(info: BranchInfo, w: World, samples = new Map<string, StatSa
   return br;
 }
 
-function init(config: Parameters<typeof World.create>[1], settings: BrainSettings, heroCount: number): void {
+function reset(): void {
   for (const br of branches.values()) br.director.abortAll();
   branches.clear();
   displayAt.clear();
   shownUserWait = undefined;
+}
+
+function init(config: Parameters<typeof World.create>[1], settings: BrainSettings, heroCount: number): void {
+  reset();
   const era = getEra(config.eraId);
   const w = World.create(era, config);
   w.setFlags({ reflections: settings.level >= 2, inherit: settings.level > 0 });
@@ -275,13 +284,85 @@ function flush(br: Branch, events: WorldEvent[], withBots: boolean): void {
 }
 
 function sampleAll(br: Branch, w: World): void {
+  sampleInto(br.samples, w);
+}
+
+function sampleInto(samples: Map<string, StatSample[]>, w: World): void {
   const t = w.tick;
   for (const b of w.aliveBots()) {
-    let arr = br.samples.get(b.id);
-    if (!arr) { arr = []; br.samples.set(b.id, arr); }
+    let arr = samples.get(b.id);
+    if (!arr) { arr = []; samples.set(b.id, arr); }
     if (arr.length && arr[arr.length - 1].tick >= t) continue;
     arr.push({ tick: t, health: Math.round(b.state.health), happiness: Math.round(b.state.happiness), netWorth: Math.round(b.state.wealth + (b.state.vars.assets ?? 0) - (b.state.vars.debt ?? 0)) });
   }
+}
+
+// ---------- 存档与读档 ----------
+
+/** 存档：每个分支记下配置、智能时间线和画面所在位置之前的全部非规则答案 */
+function makeSave(): SaveFile {
+  const main = branches.get('main') ?? [...branches.values()][0];
+  const mw = world(main);
+  const saved: SavedBranch[] = [...branches.values()].map((br) => {
+    const w = world(br);
+    const display = Math.max(0, Math.min(displayAt.get(br.info.id) ?? 0, br.director.frontier));
+    const portraits: Record<string, string> = {};
+    for (const b of Object.values(w.state.bots)) if (b.portrait) portraits[b.id] = b.portrait;
+    return { info: br.info, display, intelChanges: w.state.intelChanges, answers: w.exportAnswers(display), portraits };
+  });
+  const active = branches.get(activeId) ?? main;
+  const display = saved.find((b) => b.info.id === active.info.id)?.display ?? 0;
+  return {
+    format: 'lifegame-save',
+    version: 1,
+    savedAt: new Date().toISOString(),
+    config: mw.state.config,
+    flags: mw.state.flags,
+    active: active.info.id,
+    compare: active.info.parentId,
+    branches: saved,
+    meta: {
+      year: mw.state.config.startYear + Math.floor(display / 12),
+      heroes: Object.values(world(active).state.bots).filter((b) => b.lead).map((b) => b.name),
+      branches: saved.length,
+      eraName: mw.era.name,
+    },
+  };
+}
+
+/** 读档：每个分支从头重放到画面所在位置，不调用模型 */
+function load(file: SaveFile, settings: BrainSettings): void {
+  reset();
+  setBrain(settings);
+  const era = getEra(file.config.eraId);
+  for (const sb of file.branches) {
+    const samples = new Map<string, StatSample[]>();
+    const w = World.replay(era, { config: file.config, flags: file.flags, intelChanges: sb.intelChanges, answers: sb.answers }, sb.display, (x) => {
+      if (x.tick % 12 === 0) sampleInto(samples, x);
+    });
+    for (const [id, p] of Object.entries(sb.portraits)) { const b = w.bot(id); if (b) b.portrait = p; }
+    const br = makeBranch(sb.info, w, samples);
+    branches.set(sb.info.id, br);
+    displayAt.set(sb.info.id, sb.display);
+    if (sb.info.id === file.branches[0].info.id) {
+      post({
+        type: 'ready', branch: sb.info, config: file.config, bots: allSummaries(w), display: sb.display,
+        era: { id: era.id, name: era.name, description: era.description, theme: era.theme },
+      });
+    } else {
+      post({ type: 'branch', branch: sb.info, fromSeq: 0, display: sb.display });
+    }
+    // 回看众生相用的逐年资产
+    const frames: Record<number, Record<string, number>> = {};
+    for (const [id, arr] of samples) for (const smp of arr) (frames[smp.tick] ??= {})[id] = smp.netWorth;
+    post({ type: 'frames', branchId: sb.info.id, frames });
+    flush(br, w.state.log, true);
+  }
+  activeId = branches.has(file.active) ? file.active : file.branches[0].info.id;
+  const display = displayAt.get(activeId) ?? 0;
+  post({ type: 'loaded', active: activeId, compare: file.compare && branches.has(file.compare) ? file.compare : undefined, year: file.config.startYear + Math.floor(display / 12) });
+  void loop();
+  wake();
 }
 
 // ---------- 分叉 ----------

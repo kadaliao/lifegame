@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { DecisionPanel } from './components/DecisionPanel.js';
+import { SavesPanel } from './components/SavesPanel.js';
 import { Settings } from './components/Settings.js';
 import { Sidebar } from './components/Sidebar.js';
 import { caughtUp, nowOf, useBranch, useStore } from './store.js';
@@ -30,6 +31,9 @@ export function App() {
   const errors = useStore((s) => s.errors);
   const dismiss = useStore((s) => s.dismissError);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
+  const setSavesOpen = useStore((s) => s.setSavesOpen);
+  const notice = useStore((s) => s.notice);
+  const loading = useStore((s) => s.loading);
   const restart = useStore((s) => s.restart);
   const config = useStore((s) => s.config);
 
@@ -51,7 +55,7 @@ export function App() {
     r.setProperty('--ink', era.theme.ink);
   }, [era]);
 
-  if (!branch || !config) return <div className="boot">世界正在成形…</div>;
+  if (!branch || !config) return <div className="boot">{loading ? '正在重放存档里的世界…' : '世界正在成形…'}</div>;
   const s = branch.summary;
   const maxTick = (config.endYear - config.startYear) * 12;
   const simTick = s?.tick ?? 0;
@@ -90,6 +94,7 @@ export function App() {
         </div>
         <div className="right">
           {usage && <span className="muted small" title={Object.entries(usage.byModel).map(([k, v]) => `${k}: ${v.calls} 次`).join('\n')}>模型 {usage.calls} 次 · {fmtTokens(usage.input + usage.output)} tokens{usage.cacheHits ? ` · 缓存 ${usage.cacheHits}` : ''}{queue > 0 ? ` · 排队 ${queue}` : ''}{usage.errors ? ` · 重试 ${usage.errors}` : ''}</span>}
+          <button className="ghost" onClick={() => setSavesOpen(true)} title="保存、读取、导入导出世界">▤ 存档</button>
           <button className="ghost" onClick={restart} title="同样的设置重开">↺ 重开</button>
           <button className="ghost" onClick={() => setSettingsOpen(true)}>⚙ 设置</button>
         </div>
@@ -112,6 +117,8 @@ export function App() {
       </main>
       <DecisionPanel />
       <Settings />
+      <SavesPanel />
+      {notice && <div className="notice">{notice}</div>}
       {errors.length > 0 && (
         <div className="toasts">
           {errors.map((e, i) => <div key={i} className="toast" onClick={() => dismiss(i)}>{e}</div>)}

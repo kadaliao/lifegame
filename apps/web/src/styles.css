@@ -138,3 +138,29 @@ code { background: rgba(0,0,0,.06); padding: 0 4px; border-radius: 3px; }
 
 .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 6px; z-index: 40; }
 .toast { background: #2b2622; color: #f6f1e7; padding: 8px 12px; border-radius: 8px; font-size: 12px; max-width: 420px; cursor: pointer; }
+
+/* saves */
+.modal.saves { width: min(680px, calc(100% - 40px)); }
+.save-new { display: flex; gap: 8px; margin: 12px 0; }
+.save-new input { flex: 1; }
+.save-list { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow: auto; }
+.save-list li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 4px; border-top: 1px solid var(--line); }
+.save-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.save-actions { display: flex; gap: 6px; flex: none; }
+button.danger { background: var(--accent); color: #fff; border-color: transparent; }
+.notice { position: fixed; left: 50%; top: 58px; transform: translateX(-50%); background: var(--ink); color: var(--paper); padding: 7px 16px; border-radius: 18px; font-size: 13px; z-index: 50; box-shadow: 0 6px 20px rgba(43,38,34,.25); }
+
+/* 顶栏放不下时：按钮不折行，中间的时间信息省略 */
+.top { flex-wrap: nowrap; gap: 16px; min-width: 0; }
+.top button, .brand, .brand h1, .seg button { white-space: nowrap; }
+.brand { flex: none; }
+.clock { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.clock .waiting { margin-left: 8px; }
+.controls { flex: 1 1 260px; min-width: 0; }
+.scrub { min-width: 60px; }
+.right { flex: none; }
+.right .small { white-space: nowrap; }
+@media (max-width: 1700px) {
+  .brand .muted { display: none; }
+  .right .small { max-width: 180px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: middle; }
+}

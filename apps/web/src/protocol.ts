@@ -1,6 +1,7 @@
 import type { BotSummary } from '@lifegame/core';
 import type { ProviderConfig, UsageRecord } from '@lifegame/llm';
-import type { Bot, DecisionNode, WorldConfig, WorldEvent, WorldSummary } from '@lifegame/schema';
+import type { ScriptedChoices } from '@lifegame/core';
+import type { Bot, DecisionNode, IntelChange, WorldConfig, WorldEvent, WorldFlags, WorldSummary } from '@lifegame/schema';
 
 export type IntelligenceLevel = 0 | 1 | 2;
 
@@ -28,7 +29,9 @@ export type MainToWorker =
   | { type: 'fork'; decisionId: string; choice: string }
   | { type: 'setBrain'; brain: BrainSettings }
   | { type: 'getBot'; branchId: string; botId: string }
-  | { type: 'setActiveBranch'; branchId: string };
+  | { type: 'setActiveBranch'; branchId: string }
+  | { type: 'save'; requestId: string }
+  | { type: 'load'; file: SaveFile; brain: BrainSettings };
 
 export interface BranchInfo {
   id: string;
@@ -37,15 +40,40 @@ export interface BranchInfo {
   label: string;
 }
 
+/** 一个分支的存档：从头重放所需的全部信息。答案只收画面所在位置之前提出的 */
+export interface SavedBranch {
+  info: BranchInfo;
+  display: number;
+  intelChanges: IntelChange[];
+  answers: ScriptedChoices;
+  /** 命运旁白只用于展示，单独保存 */
+  portraits: Record<string, string>;
+}
+
+export interface SaveFile {
+  format: 'lifegame-save';
+  version: 1;
+  savedAt: string;
+  config: WorldConfig;
+  flags: WorldFlags;
+  active: string;
+  compare?: string;
+  branches: SavedBranch[];
+  meta: { year: number; heroes: string[]; branches: number; eraName: string };
+}
+
 export type WorkerToMain =
-  | { type: 'ready'; branch: BranchInfo; config: WorldConfig; era: { id: string; name: string; description: string; theme: { accent: string; paper: string; ink: string; fontFamily: string } }; bots: BotSummary[] }
+  | { type: 'ready'; branch: BranchInfo; config: WorldConfig; era: { id: string; name: string; description: string; theme: { accent: string; paper: string; ink: string; fontFamily: string } }; bots: BotSummary[]; display?: number }
   | { type: 'tick'; branchId: string; summary: WorldSummary; frontier: number; events: WorldEvent[]; bots?: BotSummary[]; finished: boolean }
   | { type: 'pending'; branchId: string; node: DecisionNode; needsUser: boolean }
   | { type: 'decided'; branchId: string; node: DecisionNode }
   | { type: 'thinking'; branchId: string; botId: string; kind: string; on: boolean }
   | { type: 'reflection'; branchId: string; botId: string; stage: string; text: string }
   | { type: 'bot'; branchId: string; bot: Bot; samples: StatSample[]; decisions: DecisionNode[] }
-  | { type: 'branch'; branch: BranchInfo; fromSeq: number }
+  | { type: 'branch'; branch: BranchInfo; fromSeq: number; display?: number }
+  | { type: 'frames'; branchId: string; frames: Record<number, Record<string, number>> }
+  | { type: 'saved'; requestId: string; file: SaveFile }
+  | { type: 'loaded'; active: string; compare?: string; year: number }
   | { type: 'rewind'; branchId: string; fromSeq: number; fromTick: number }
   | { type: 'usage'; usage: UsageRecord; queue: number }
   | { type: 'error'; message: string };

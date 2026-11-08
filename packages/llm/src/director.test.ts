@@ -38,6 +38,17 @@ async function drive(world: World, mode: 'patient' | 'tight'): Promise<Director>
 
 const texts = (w: World) => w.state.log.map((e) => e.text);
 
+async function finish(d: Director): Promise<void> {
+  let guard = 0;
+  while ((!d.world.finished || d.unsettled) && guard++ < 100_000) {
+    if (d.world.finished || d.world.tick >= d.target) { await d.whenAnswer(30); continue; }
+    const r = d.step();
+    if (!r.advanced) await d.whenAnswer(30);
+  }
+}
+
+const mkBrain = () => new Brain({ providers: { mock: new JitteryMock() }, defaultModel: { providerId: 'mock', model: 'mock' }, concurrency: 3 });
+
 describe('Director', () => {
   it('推测执行的最终世界，与一个个老实等出来的世界逐字相同', async () => {
     const patient = await drive(makeWorld(), 'patient');
@@ -61,4 +72,40 @@ describe('Director', () => {
     expect(heirs.every((x) => !x.lead)).toBe(true);
     expect(texts(b.world)).toEqual(texts(a.world));
   }, 60_000);
+
+  it('存档读档：重放到画面所在位置逐字一致，之后继续跑结果也相同', async () => {
+    let display = 0;
+    const d = new Director(makeWorld({ reflections: true, inherit: true }), mkBrain(), { display: () => display, ahead: () => 36 });
+    const extra = d.world.state.botOrder[20];
+    let changed = false;
+    // 画面按 frontier 允许的速度前进；中途给一个路人赋予智能
+    while (display < 330) {
+      if (d.world.tick < d.target) {
+        const r = d.step();
+        if (!r.advanced) await d.whenAnswer(15);
+      } else {
+        await d.whenAnswer(5);
+      }
+      display = Math.min(display + 2, d.frontier);
+      if (display >= 160 && !changed) {
+        changed = true;
+        d.change((w) => w.setIntelligence(extra, 'llm', 'mock/mock', true));
+      }
+    }
+    const w = d.world;
+    const save = { config: w.state.config, flags: w.state.flags, intelChanges: w.state.intelChanges, answers: w.exportAnswers(display) };
+    const loaded = World.replay(chinaModern, JSON.parse(JSON.stringify(save)), display);
+    // 画面所在这个月，原来的世界可能还停在月初等答案，只比较之前的
+    const upTo = (x: World) => x.state.log.filter((e) => e.tick < display).map((e) => e.text);
+    expect(upTo(loaded).length).toBeGreaterThan(500);
+    expect(upTo(loaded)).toEqual(upTo(w));
+    expect(loaded.bot(extra)!.intelligence).toBe('llm');
+
+    // 两边都老实跑完
+    display = -Infinity;
+    await finish(d);
+    const d2 = new Director(loaded, mkBrain(), { display: () => -Infinity, ahead: () => 36 });
+    await finish(d2);
+    expect(texts(d2.world)).toEqual(texts(d.world));
+  }, 90_000);
 });

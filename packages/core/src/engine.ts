@@ -1,7 +1,7 @@
 import {
   TICKS_PER_YEAR, ageAt, tickToYearMonth,
   type Bot, type DecisionNode, type DecisionResolver, type IntelligenceMode,
-  type WorldConfig, type WorldEvent, type WorldFlags, type WorldStateShape, type WorldSummary, type LifeStage,
+  type IntelChange, type WorldConfig, type WorldEvent, type WorldFlags, type WorldStateShape, type WorldSummary, type LifeStage,
 } from '@lifegame/schema';
 import { Rng } from './rng.js';
 import type { DecisionRequest, EraContext, EraPack, LogInput } from './era.js';
@@ -92,6 +92,7 @@ export class World {
       openDecisionIds: [],
       provisionalIds: [],
       flags: { reflections: false, inherit: false },
+      intelChanges: [],
       eraState: era.initEraState(),
       nextId: 1,
     };
@@ -237,6 +238,7 @@ export class World {
     this.ctx.year = year;
     this.ctx.month = month;
 
+    for (const c of this.state.intelChanges) if (c.tick === t) this.applyIntel(c);
     this.curRng = this.rng;
     if (month === 1) this.era.onYear(this.ctx);
     this.applyDue(t);
@@ -387,12 +389,50 @@ export class World {
     }
   }
 
+  /** 从现在（这个月）起改变某人的智能设定，记入时间线，重放时在同一个月生效 */
   setIntelligence(botId: string, mode: IntelligenceMode, model?: string, lead = mode === 'llm'): void {
-    const bot = this.state.bots[botId];
+    if (!this.state.bots[botId]) return;
+    const c: IntelChange = { tick: this.state.tick, botId, intelligence: mode, model, lead: mode === 'llm' && lead };
+    this.state.intelChanges.push(c);
+    this.applyIntel(c);
+  }
+
+  private applyIntel(c: IntelChange): void {
+    const bot = this.state.bots[c.botId];
     if (!bot) return;
-    bot.intelligence = mode;
-    bot.model = model;
-    bot.lead = mode === 'llm' && lead;
+    bot.intelligence = c.intelligence;
+    bot.model = c.model;
+    bot.lead = c.intelligence === 'llm' && !!c.lead;
+  }
+
+  /**
+   * 存档用：能让世界一直重放到 untilTick 的全部非规则答案。
+   * 只收提出时间不晚于 untilTick 的（之后的问题可能建立在未确认的推测上）；
+   * 主角未确认的推测不收，读档后重新问；已在画面里生效的配角推测当真。
+   */
+  exportAnswers(untilTick: number): ScriptedChoices {
+    const out: ScriptedChoices = {};
+    for (const d of Object.values(this.state.decisions)) {
+      if (d.chosen === undefined || d.resolvedBy === 'rules' || d.tick > untilTick) continue;
+      if (d.provisional && d.dueTick > untilTick) continue;
+      out[d.id] = { ...scriptOf(d), provisional: undefined };
+    }
+    return out;
+  }
+
+  /** 读档：从头按原来的配置、智能时间线和答案重放到 untilTick（含） */
+  static replay(era: EraPack, save: { config: WorldConfig; flags: WorldFlags; intelChanges: IntelChange[]; answers: ScriptedChoices }, untilTick: number, onStep?: (w: World, events: WorldEvent[]) => void): World {
+    const w = World.create(era, save.config);
+    w.state.flags = { ...save.flags };
+    w.state.intelChanges = save.intelChanges.map((c) => ({ ...c }));
+    w.scripted = save.answers;
+    while (!w.finished && w.tick <= untilTick) {
+      const r = w.step();
+      onStep?.(w, r.events);
+      if (r.blocked.length) break;
+    }
+    w.scripted = {};
+    return w;
   }
 
   // ---------- 分叉 ----------
@@ -422,7 +462,7 @@ export class World {
     child.state.parentBranchId = this.state.branchId;
     child.state.forkedAtTick = node.tick;
     child.state.flags = { ...this.state.flags };
-    child.copyIntelligenceFrom(this);
+    child.state.intelChanges = this.state.intelChanges.map((c) => ({ ...c }));
     // 重放到改选被提出的那个月，之后的世界开始分歧
     while (child.state.tick <= node.tick && !child.finished) {
       if (child.step().blocked.length) break;
@@ -451,17 +491,9 @@ export class World {
     w.state.parentBranchId = this.state.parentBranchId;
     w.state.forkedAtTick = this.state.forkedAtTick;
     w.state.flags = { ...this.state.flags };
-    w.copyIntelligenceFrom(this);
+    // 快照之后的设定变化在重放中按原来的时刻生效
+    w.state.intelChanges = this.state.intelChanges.map((c) => ({ ...c }));
     return w;
-  }
-
-  /** 快照里存的是旧的智能设定，换成现在的 */
-  private copyIntelligenceFrom(other: World): void {
-    for (const id of this.state.botOrder) {
-      const o = other.state.bots[id];
-      const b = this.state.bots[id];
-      if (o && b) { b.intelligence = o.intelligence; b.model = o.model; b.lead = o.lead; }
-    }
   }
 
   /** 回退时第一个快照所在 tick（日志从这里开始会重新生成） */
@@ -605,6 +637,7 @@ function normalize(state: WorldStateShape): void {
   state.openDecisionIds ??= [];
   state.provisionalIds ??= [];
   state.flags ??= { reflections: false, inherit: false };
+  state.intelChanges ??= [];
 }
 
 export function stageName(stage: LifeStage): string {
