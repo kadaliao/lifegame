@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/schema" },
+    { "path": "packages/core" },
+    { "path": "packages/eras" },
+    { "path": "packages/llm" },
+    { "path": "apps/cli" },
+    { "path": "apps/web" }
+  ]
+}

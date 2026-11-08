@@ -1,0 +1,17 @@
+{
+  "name": "@lifegame/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@lifegame/core": "workspace:*",
+    "@lifegame/eras": "workspace:*",
+    "@lifegame/llm": "workspace:*",
+    "@lifegame/schema": "workspace:*"
+  },
+  "devDependencies": { "tsx": "^4.19.2" }
+}
