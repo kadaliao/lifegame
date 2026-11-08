@@ -163,8 +163,6 @@ export class World {
     if (this.finished) {
       return { tick: this.state.tick, events: [], pending: [], finished: true };
     }
-    this.stepEvents = [];
-    this.stepPending = [];
     const t = this.state.tick;
     const { year, month } = tickToYearMonth(t, this.state.config.startYear);
     this.ctx.tick = t;
@@ -202,7 +200,12 @@ export class World {
     this.state.tick++;
     if (this.state.tick % TICKS_PER_YEAR === 0) this.takeSnapshot();
     this.flushScripted();
-    return { tick: this.state.tick, events: this.stepEvents, pending: this.stepPending, finished: this.finished };
+    // 两次 step 之间（驱动层解决决策时）产生的事件也会累积在缓冲里，随本次一起交出
+    const events = this.stepEvents;
+    const pending = this.stepPending.filter((n) => n.chosen === undefined);
+    this.stepEvents = [];
+    this.stepPending = [];
+    return { tick: this.state.tick, events, pending, finished: this.finished };
   }
 
   /** 回放时，按挂起顺序解决有脚本的决策。驱动层也必须按 pending 顺序解决，否则回放会分歧 */

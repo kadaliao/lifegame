@@ -4,10 +4,19 @@ import { chinaModern } from '../../eras/src/index.js';
 
 const cfg = { seed: 7, eraId: 'china-modern', population: 60, startYear: 1980, endYear: 2040, birthSpan: 10 };
 
+/** 驱动层契约：每次 step 后循环解决 pending 直到为空（决策可能连锁产生新决策） */
+function drain(w: World, pick: (d: ReturnType<World['step']>['pending'][number]) => string, by: 'user' | 'llm' = 'user', onEach?: (id: string) => void) {
+  while (w.pending.length) {
+    const d = w.pending[0];
+    onEach?.(d.id);
+    w.resolveDecision(d.id, pick(d), by, by === 'llm' ? 'm' : undefined);
+  }
+}
+
 function runAll(w: World) {
   while (!w.finished) {
-    const r = w.step();
-    for (const d of r.pending) w.resolveDecision(d.id, d.options[0].id, 'user');
+    w.step();
+    drain(w, (d) => d.options[0].id);
   }
 }
 
@@ -35,12 +44,8 @@ describe('World', () => {
     w.setIntelligence(hero, 'llm', 'mock');
     let pendingSeen = 0;
     while (!w.finished) {
-      const r = w.step();
-      for (const d of r.pending) {
-        expect(d.botId).toBe(hero);
-        pendingSeen++;
-        w.resolveDecision(d.id, d.options[d.options.length - 1].id, 'llm', '随便选一个');
-      }
+      w.step();
+      drain(w, (d) => { expect(d.botId).toBe(hero); pendingSeen++; return d.options[d.options.length - 1].id; }, 'llm');
     }
     expect(pendingSeen).toBeGreaterThan(2);
     expect(() => {
@@ -60,11 +65,8 @@ describe('World', () => {
     w.setIntelligence(hero, 'llm');
     const chosen: string[] = [];
     while (!w.finished) {
-      const r = w.step();
-      for (const d of r.pending) {
-        chosen.push(d.id);
-        w.resolveDecision(d.id, d.options[0].id, 'llm', 'm');
-      }
+      w.step();
+      drain(w, (d) => d.options[0].id, 'llm', (id) => chosen.push(id));
     }
     const before = JSON.stringify(w.state.log);
     const target = w.state.decisions[chosen[1]];
@@ -82,11 +84,10 @@ describe('World', () => {
     const pb = child.state.log.slice(0, prefixLen).map((e) => e.text).join('|');
     expect(pb).toBe(pa);
     // 分叉后，改选引发的连锁决策会挂起，交给驱动层
-    for (const d of child.pending) child.resolveDecision(d.id, d.options[0].id, 'llm', 'm');
-    // 继续跑分支
+    drain(child, (d) => d.options[0].id, 'llm');
     while (!child.finished) {
-      const r = child.step();
-      for (const d of r.pending) child.resolveDecision(d.id, d.options[0].id, 'llm', 'm');
+      child.step();
+      drain(child, (d) => d.options[0].id, 'llm');
     }
     expect(JSON.stringify(child.state.log)).not.toBe(before);
     expect(child.state.branchId).toBe('alt');

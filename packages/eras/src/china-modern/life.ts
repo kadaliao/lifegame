@@ -252,7 +252,7 @@ function schooling(bot: Bot, age: number, ctx: EraContext): void {
     zhongkao(bot, ctx);
     return;
   }
-  if (age === 18 && hasTag(bot, 'path:senior')) {
+  if ((age === 18 && hasTag(bot, 'path:senior')) || (age > 18 && hasTag(bot, 'path:retry'))) {
     untag(bot, 'student');
     untag(bot, 'path');
     st.education = 'senior';

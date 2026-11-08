@@ -18,9 +18,9 @@ const world = World.create(era, {
 const t0 = performance.now();
 let steps = 0;
 while (!world.finished) {
-  const res = world.step();
+  world.step();
   steps++;
-  for (const d of res.pending) world.resolveDecision(d.id, d.options[0].id, 'rules');
+  while (world.pending.length) world.resolveDecision(world.pending[0].id, world.pending[0].options[0].id, 'rules');
 }
 const ms = performance.now() - t0;
 const sum = world.summary();
