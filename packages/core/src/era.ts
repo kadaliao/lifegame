@@ -68,4 +68,6 @@ export interface EraPack {
   situationCard(bot: Bot, ctx: EraContext): string;
   /** 世界历史背景一句话 */
   eraCard(ctx: EraContext): string;
+  /** 名义工资指数，用于把不同年份的钱折算到同一水平 */
+  wageIndex?(year: number): number;
 }

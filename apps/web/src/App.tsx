@@ -1,9 +1,10 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { DecisionPanel } from './components/DecisionPanel.js';
 import { Settings } from './components/Settings.js';
 import { Sidebar } from './components/Sidebar.js';
 import { useBranch, useStore } from './store.js';
 import { LifeScroll } from './views/LifeScroll.js';
+import { PeopleView } from './views/PeopleView.js';
 import { TimeRiver } from './views/TimeRiver.js';
 
 const SPEEDS: Array<[number, string]> = [[6, '慢'], [24, '2年/秒'], [96, '8年/秒'], [Infinity, '极速']];
@@ -30,6 +31,14 @@ export function App() {
   const restart = useStore((s) => s.restart);
   const config = useStore((s) => s.config);
 
+  const [view, setView] = useState<'river' | 'people'>(() => {
+    try { return localStorage.getItem('lifegame.view') === 'people' ? 'people' : 'river'; } catch { return 'river'; }
+  });
+  const switchView = (v: 'river' | 'people') => {
+    setView(v);
+    try { localStorage.setItem('lifegame.view', v); } catch { /* ignore */ }
+  };
+
   useEffect(() => { boot(); }, [boot]);
 
   useEffect(() => {
@@ -46,15 +55,20 @@ export function App() {
   const nowTick = s?.tick ?? 0;
   const shown = viewTick ?? nowTick;
   const year = config.startYear + Math.floor(shown / 12);
+  const counts = viewTick === undefined || !s ? { alive: s?.alive ?? 0, dead: s?.dead ?? 0 } : countAt(branch.bots, shown);
   const month = (shown % 12) + 1;
 
   return (
     <div className="app">
       <header className="top">
         <div className="brand"><h1>人生游戏</h1><span className="muted">{era?.name}</span></div>
+        <div className="seg views">
+          <button className={view === 'river' ? 'on' : ''} onClick={() => switchView('river')} title="每个家族的人生轨迹，和众人汇成的河">长河</button>
+          <button className={view === 'people' ? 'on' : ''} onClick={() => switchView('people')} title="此刻每个人在年龄与财富上的位置">众生相</button>
+        </div>
         <div className="clock">
           <b>{year}</b><span className="muted">年{month}月</span>
-          {s && <span className="muted"> · 在世 {s.alive} · 离世 {s.dead}</span>}
+          {s && <span className="muted"> · 在世 {counts.alive} · 离世 {counts.dead}</span>}
           {branch.info.id !== 'main' && <span className="hero-tag">{branch.info.label}</span>}
         </div>
         <div className="controls">
@@ -74,7 +88,7 @@ export function App() {
       <main className={`body ${compareBranch ? 'compare' : ''}`}>
         <Sidebar branch={branch} />
         <section className="center">
-          <TimeRiver branch={branch} />
+          {view === 'river' ? <TimeRiver key={`r-${branch.info.id}`} branch={branch} /> : <PeopleView branch={branch} />}
         </section>
         <section className="side">
           {compareBranch && compareId ? (
@@ -96,6 +110,18 @@ export function App() {
       )}
     </div>
   );
+}
+
+function countAt(bots: Record<string, { birthTick: number; deathTick?: number }>, t: number): { alive: number; dead: number } {
+  let alive = 0;
+  let dead = 0;
+  for (const id in bots) {
+    const b = bots[id];
+    if (b.birthTick > t) continue;
+    if (b.deathTick !== undefined && b.deathTick <= t) dead++;
+    else alive++;
+  }
+  return { alive, dead };
 }
 
 function fmtTokens(n: number): string {

@@ -130,8 +130,12 @@ export function createChildBot(ctx: EraContext, mother: Bot, father: Bot, birthT
   const values = rollValues(rng, personality, origin);
   const id = ctx.nextId('b');
   const family = father.name.length > 2 && !/^[欧上司诸东南西北]/.test(father.name) ? father.name[0] : father.name[0];
+  // 避开兄弟姐妹的名字
+  const siblingNames = new Set([...mother.childrenIds, ...father.childrenIds].map((cid) => ctx.bot(cid)?.name));
+  let name = fullName(rng, sex, year, family || surname(rng));
+  for (let i = 0; i < 8 && siblingNames.has(name); i++) name = fullName(rng, sex, year, family || surname(rng));
   return newBotBase(ctx, {
-    id, name: fullName(rng, sex, year, family || surname(rng)), sex, birthTick,
+    id, name, sex, birthTick,
     familyId: father.familyId, parentIds: [father.id, mother.id], generation: Math.max(father.generation, mother.generation) + 1,
     origin, personality, talents, values,
   });

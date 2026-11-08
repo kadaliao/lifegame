@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { stageName } from '@lifegame/core';
 import type { DecisionNode, LifeStage, WorldEvent } from '@lifegame/schema';
 import { fmtMoney, useStore, type BotDetail, type BranchData } from '../store.js';
-import { eduLabel } from './TimeRiver.js';
+import { eduLabel } from '../util.js';
 
 const STAGES: LifeStage[] = ['infant', 'child', 'teen', 'youth', 'adult', 'middle', 'senior'];
 const STAGE_AGE: Record<LifeStage, number> = { infant: 0, child: 3, teen: 12, youth: 18, adult: 30, middle: 45, senior: 60 };

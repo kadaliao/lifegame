@@ -1,7 +1,7 @@
 import type { EraContext, EraPack } from '@lifegame/core';
 import type { Bot, LifeStage } from '@lifegame/schema';
 import { EDU_LABEL, createChildBot, createInitialBot, personaCard } from './bots.js';
-import { REGION_NAME, TIMELINE } from './data.js';
+import { REGION_NAME, TIMELINE, wageIndex } from './data.js';
 import { checkDischarge, decisions, es, initEraState, onBirthday, onTick, onYear } from './life.js';
 
 function money(n: number): string {
@@ -68,6 +68,8 @@ export const chinaModern: EraPack = {
     lines.push(`健康${Math.round(st.health)}/100，近期心情${st.happiness > 65 ? '不错' : st.happiness > 40 ? '一般' : '低落'}。`);
     return lines.join('\n');
   },
+
+  wageIndex,
 
   eraCard(ctx: EraContext): string {
     const s = es(ctx);

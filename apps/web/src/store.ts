@@ -19,6 +19,14 @@ export interface BranchData {
   summary?: WorldSummary;
   finished: boolean;
   decided: Record<string, DecisionNode>;
+  /** 每年一帧：tick → botId → 净资产，供回看时还原众生相 */
+  frames: Record<number, Record<string, number>>;
+}
+
+function frameOf(bots: BotSummary[], tick: number): Record<string, number> {
+  const f: Record<string, number> = {};
+  for (const b of bots) if (b.birthTick <= tick && (b.deathTick ?? Infinity) > tick) f[b.id] = b.wealth;
+  return f;
 }
 
 export interface WorldSettings {
@@ -210,7 +218,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       for (const b of m.bots) bots[b.id] = b;
       set({
         config: m.config, era: m.era,
-        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {} } },
+        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: { 0: frameOf(m.bots, 0) } } },
         activeBranch: m.branch.id,
       });
       const hero = m.bots.find((b) => b.intelligence === 'llm') ?? m.bots[0];
@@ -228,6 +236,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
           for (const b of m.bots) bots[b.id] = b;
           next.bots = bots;
           next.botOrder = m.bots.map((b) => b.id);
+          next.frames = { ...br.frames, [m.summary.tick]: frameOf(m.bots, m.summary.tick) };
         }
         return { branches: { ...s.branches, [m.branchId]: next } };
       });
@@ -281,8 +290,10 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         const events = parent ? parent.events.filter((e) => e.tick < snapTick) : [];
         const decided: Record<string, DecisionNode> = {};
         if (parent) for (const d of Object.values(parent.decided)) if (d.tick < snapTick) decided[d.id] = d;
+        const frames: Record<number, Record<string, number>> = {};
+        if (parent) for (const [k, f] of Object.entries(parent.frames)) if (Number(k) <= snapTick) frames[Number(k)] = f;
         return {
-          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided } },
+          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames } },
           activeBranch: m.branch.id,
           compareBranch: m.branch.parentId,
           viewTick: undefined,

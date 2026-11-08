@@ -66,7 +66,7 @@ export function onYear(ctx: EraContext): void {
     if (ctx.year < ev.year || ctx.year >= ev.year + dur) continue;
     s.active.push(ev.id);
     if (ctx.year === ev.year) {
-      ctx.log({ type: 'world', importance: 6, text: `${ev.year}年：${ev.title}。${ev.text}`, data: { id: ev.id, speculative: ev.speculative ?? false } });
+      ctx.log({ type: 'world', importance: 6, text: `${ev.year}年：${ev.title}。${ev.text}`, data: { id: ev.id, title: ev.title, speculative: ev.speculative ?? false } });
     }
     switch (ev.id) {
       case 'inflation': m.hiring *= 0.7; break;
