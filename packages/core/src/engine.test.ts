@@ -21,6 +21,14 @@ function runAll(w: World, pick: (d: DecisionNode) => string = (d) => d.options[0
   }
 }
 
+/** 挑一个能活到要拿主意的年纪的人当主角：同样的种子先按规则跑一遍（第一个决定之前的人生与智能设定无关） */
+function survivor(c = cfg): string {
+  const w = World.create(chinaModern, c);
+  runAll(w);
+  const decided = new Set(Object.values(w.state.decisions).filter((d) => d.options.length > 1).map((d) => d.botId));
+  return w.state.botOrder.find((id) => w.state.bots[id].generation === 0 && decided.has(id))!;
+}
+
 describe('World', () => {
   it('同种子两次运行事件日志完全一致', () => {
     const a = World.create(chinaModern, cfg);
@@ -41,7 +49,7 @@ describe('World', () => {
 
   it('犹豫期里世界照常前进，到期还没答案才停下', () => {
     const w = World.create(chinaModern, cfg);
-    const hero = w.state.botOrder[0];
+    const hero = survivor();
     w.setIntelligence(hero, 'llm');
     let first: DecisionNode | undefined;
     while (!first && !w.finished) {
@@ -83,7 +91,7 @@ describe('World', () => {
 
   it('分叉：改选一个决策后，分叉前的历史一致，之后分歧，原分支不受影响', () => {
     const w = World.create(chinaModern, cfg);
-    const hero = w.state.botOrder[0];
+    const hero = survivor();
     w.setIntelligence(hero, 'llm');
     const asked: string[] = [];
     runAll(w, (d) => d.options[0].id, (d) => asked.push(d.id));

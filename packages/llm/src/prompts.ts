@@ -7,13 +7,13 @@ function ctxOf(world: World) {
   return (world as unknown as { ctx: Parameters<World['era']['personaCard']>[1] }).ctx;
 }
 
-/** 近期重要记忆：按重要度与新近度取 n 条 */
-export function recentMemories(world: World, bot: Bot, n = 10): string[] {
+/** 近期重要记忆：按重要度与新近度取 n 条。upTo：只算日志前多少条之内的事（提出决定的那一刻） */
+export function recentMemories(world: World, bot: Bot, n = 10, upTo = world.state.log.length): string[] {
   const log = world.state.log;
   const startYear = world.state.config.startYear;
   const scored = bot.memory
-    .filter((m) => log[m.eventSeq]?.type !== 'decision' || log[m.eventSeq]?.importance >= 7)
-    .map((m) => ({ m, score: m.importance + (m.eventSeq / Math.max(1, log.length)) * 6 }))
+    .filter((m) => m.eventSeq < upTo && (log[m.eventSeq]?.type !== 'decision' || log[m.eventSeq]?.importance >= 7))
+    .map((m) => ({ m, score: m.importance + (m.eventSeq / Math.max(1, upTo)) * 6 }))
     .sort((a, b) => b.score - a.score)
     .slice(0, n)
     .sort((a, b) => a.m.eventSeq - b.m.eventSeq);
@@ -25,30 +25,34 @@ export function recentMemories(world: World, bot: Bot, n = 10): string[] {
   });
 }
 
-export function systemPrompt(world: World, bot: Bot): string {
+/** node 带着提出那一刻的处境时，一律按那一刻来写，不读现在的状态 */
+export function systemPrompt(world: World, bot: Bot, node?: DecisionNode): string {
   const era = world.era;
   const ctx = ctxOf(world);
+  const asOf = node?.asOf;
   const lines = [
     `你正在扮演一个真实的人，用第一人称思考。你不是助手，不要解释，不要说教，不要跳出角色。`,
-    `世界背景：${era.eraCard(ctx)}`,
+    `世界背景：${asOf ? asOf.era : era.eraCard(ctx)}`,
     ``,
     `【你是谁】`,
-    era.personaCard(bot, ctx),
+    asOf ? asOf.persona : era.personaCard(bot, ctx),
   ];
-  if (bot.reflections.length) {
+  const reflections = asOf ? bot.reflections.filter((r) => r.tick <= node!.tick) : bot.reflections;
+  if (reflections.length) {
     lines.push('', '【你对自己过去的总结】');
-    for (const r of bot.reflections.slice(-3)) lines.push(`- ${stageName(r.stage)}：${r.text}`);
+    for (const r of reflections.slice(-3)) lines.push(`- ${stageName(r.stage)}：${r.text}`);
   }
-  if (bot.goal) lines.push('', `【你当前的心愿】${bot.goal}`);
+  const goal = asOf ? asOf.goal : bot.goal;
+  if (goal) lines.push('', `【你当前的心愿】${goal}`);
   return lines.join('\n');
 }
 
 /** 这个人最近说过的独白，用来避免意象重复 */
-function recentMonologues(world: World, bot: Bot, n = 4): string[] {
+function recentMonologues(world: World, bot: Bot, n = 4, upTo = Infinity): string[] {
   // 只看已经生效的决定：还在犹豫期里的答案早到晚到取决于网络，放进提示词会让世界随网速变化。
   // 反思不算（它们已经以"对过去的总结"出现在系统提示里）
   return Object.values(world.state.decisions)
-    .filter((d) => d.botId === bot.id && d.applied && d.monologue && d.resolvedBy === 'llm' && d.kind !== REFLECT_KIND)
+    .filter((d) => d.botId === bot.id && d.applied && (d.appliedSeq ?? 0) < upTo && d.monologue && d.resolvedBy === 'llm' && d.kind !== REFLECT_KIND)
     .sort((a, b) => a.seq - b.seq)
     .slice(-n)
     .map((d) => d.monologue!);
@@ -57,11 +61,12 @@ function recentMonologues(world: World, bot: Bot, n = 4): string[] {
 export function decisionMessages(world: World, bot: Bot, node: DecisionNode): LlmMessage[] {
   const era = world.era;
   const ctx = ctxOf(world);
-  const mem = recentMemories(world, bot);
-  const said = recentMonologues(world, bot);
+  const upTo = node.asOf?.log;
+  const mem = recentMemories(world, bot, 10, upTo);
+  const said = recentMonologues(world, bot, 4, upTo);
   const user = [
     `【现状】`,
-    era.situationCard(bot, ctx),
+    node.asOf ? node.asOf.situation : era.situationCard(bot, ctx),
     '',
     mem.length ? `【记忆中印象最深的事】\n${mem.map((m) => `- ${m}`).join('\n')}` : '',
     '',
@@ -78,7 +83,7 @@ export function decisionMessages(world: World, bot: Bot, node: DecisionNode): Ll
     `{"choice": "<选项 id，必须是上面方括号里的一个>", "monologue": "<一两句话的内心独白，口语化，带着这个人的性格、此刻的年龄和这个年代的气息，不超过 60 字>", "goal": "<可选。只有当这个选择改变了你接下来几年的打算时才写，一句话>"}`,
   ].filter((l) => l !== undefined).join('\n');
   return [
-    { role: 'system', content: systemPrompt(world, bot) },
+    { role: 'system', content: systemPrompt(world, bot, node) },
     { role: 'user', content: user },
   ];
 }
@@ -95,7 +100,7 @@ function stageAgeRange(world: World, stage: LifeStage): [number, number] {
   return [Math.max(0, from), to];
 }
 
-export function reflectionMessages(world: World, bot: Bot, endedStage: LifeStage): LlmMessage[] {
+export function reflectionMessages(world: World, bot: Bot, endedStage: LifeStage, node?: DecisionNode): LlmMessage[] {
   const era = world.era;
   const ctx = ctxOf(world);
   const log = world.state.log;
@@ -113,9 +118,10 @@ export function reflectionMessages(world: World, bot: Bot, endedStage: LifeStage
       const age = Math.floor((e.tick - bot.birthTick) / 12);
       return `- ${year}年（${age}岁）：${e.text}`;
     });
+  const goal = node?.asOf ? node.asOf.goal : bot.goal;
   const user = [
     `【现状】`,
-    era.situationCard(bot, ctx),
+    node?.asOf ? node.asOf.situation : era.situationCard(bot, ctx),
     '',
     `【${stageName(endedStage)}里发生的事】`,
     ...stageEvents,
@@ -127,11 +133,11 @@ export function reflectionMessages(world: World, bot: Bot, endedStage: LifeStage
     `- 只依据上面列出的事来回顾，不要虚构没有列出的重大经历，比如亲人去世、发财、做生意、离婚、搬家。可以补充日常细节和心里的感受。`,
     `- 不要重复你之前的总结里的句子、意象和比喻，这是新的一段人生。`,
     `- 不要套话，要有具体的人和事。全部用中文，不要夹杂英文。`,
-    bot.goal ? `- 你之前的心愿是「${bot.goal}」。想想它实现了没有、还适不适合现在的你。` : '',
+    goal ? `- 你之前的心愿是「${goal}」。想想它实现了没有、还适不适合现在的你。` : '',
     `只输出 JSON：{"reflection": "<两三句话，不超过 120 字>", "goal": "<一句话，接下来这个人生阶段最想做成的事。要符合你现在${toAge}岁上下的年龄和处境，旧心愿实现了或不合适了就换一个新的>"}`,
   ].join('\n');
   return [
-    { role: 'system', content: systemPrompt(world, bot) },
+    { role: 'system', content: systemPrompt(world, bot, node) },
     { role: 'user', content: user },
   ];
 }

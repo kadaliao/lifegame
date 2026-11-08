@@ -1,19 +1,14 @@
 import type { EraContext, EraPack } from '@lifegame/core';
 import type { Bot, LifeStage } from '@lifegame/schema';
 import { EDU_LABEL, createChildBot, createCustomBot, createInitialBot, personaCard } from './bots.js';
-import { PARENT_JOBS, PLACES, REGION_NAME, TIMELINE, declineReason, jobTrend, wageIndex } from './data.js';
+import { PARENT_JOBS, PLACES, REGION_NAME, TIMELINE, declineReason, jobTrend, money, wageIndex } from './data.js';
 import { checkDischarge, decisions, es, initEraState, onBirthday, onTick, onYear } from './life.js';
-
-function money(n: number): string {
-  if (Math.abs(n) >= 1e8) return `${(n / 1e8).toFixed(1)}亿元`;
-  if (Math.abs(n) >= 1e4) return `${(n / 1e4).toFixed(1)}万元`;
-  return `${Math.round(n)}元`;
-}
 
 export const chinaModern: EraPack = {
   id: 'china-modern',
   // 2：各职业随年代兴衰（AI 浪潮、自动化、老龄化）
-  rulesVersion: 2,
+  // 3：日常小事按年代、城乡、家境、家里人挑选并限制重复；家里人的大事写进彼此的人生
+  rulesVersion: 3,
   name: '当代中国 1980–2060',
   description: '从改革开放到深度老龄化。高考、下海、下岗、房贷、互联网、疫情、考公、AI——一代人的八十年。',
   defaultStartYear: 1980,

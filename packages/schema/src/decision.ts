@@ -41,6 +41,19 @@ export interface DecisionNode {
   goal?: string;
   /** 提出时发给模型的提示词指纹；重放时只有指纹相同才复用旧答案 */
   promptKey?: string;
+  /** 提出那一步结束时的处境。提示词只读这一份，读档后晚几个月才生成提示词也不会变；落地后删掉 */
+  asOf?: DecisionContext;
+  /** 落地时日志已有几条：据此判断它在别的决定提出时是否已经生效 */
+  appliedSeq?: number;
+}
+
+export interface DecisionContext {
+  /** 当时日志有几条：只有这之前的事算"记得" */
+  log: number;
+  situation: string;
+  era: string;
+  persona: string;
+  goal?: string;
 }
 
 /** 模型对决策的结构化回答 */

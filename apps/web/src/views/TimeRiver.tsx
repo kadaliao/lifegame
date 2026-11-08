@@ -22,7 +22,7 @@ const CROWD_HEAD = 30;
 const STREAM_H = 180;
 const CROWD_LANE = 6;
 const STEP = 6;
-const MARKER_SKIP = new Set(['marriage', 'child', 'birth', 'stage', 'death', 'move']);
+const MARKER_SKIP = new Set(['marriage', 'child', 'birth', 'stage', 'death', 'move', 'family']);
 
 // ---------- 事件索引（增量） ----------
 interface Index {

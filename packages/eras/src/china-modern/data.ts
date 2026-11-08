@@ -237,3 +237,9 @@ export const TIMELINE: TimelineEvent[] = [
   { year: 2032, id: 'driverless', title: '无人驾驶普及', text: '无人车和无人配送铺开，司机和外卖骑手的单子越来越少。', duration: 15, speculative: true },
   { year: 2040, id: 'silver', title: '银发经济时代', text: '机器人护理与社区养老普及，年轻劳动力稀缺，工资持续上涨。', duration: 20, speculative: true },
 ];
+
+export function money(n: number): string {
+  if (Math.abs(n) >= 1e8) return `${(n / 1e8).toFixed(1)}亿元`;
+  if (Math.abs(n) >= 1e4) return `${(n / 1e4).toFixed(1)}万元`;
+  return `${Math.round(n)}元`;
+}

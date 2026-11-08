@@ -112,7 +112,7 @@ export class Brain {
     const ref = this.refOf(bot);
     const model = `${ref.providerId}/${ref.model}`;
     if (node.kind === REFLECT_KIND) {
-      const messages = reflectionMessages(world, bot, node.data?.stage as LifeStage);
+      const messages = reflectionMessages(world, bot, node.data?.stage as LifeStage, node);
       const priority = 1e6 + node.dueTick;
       return {
         key: `${model}:${hashString(JSON.stringify(messages))}`,

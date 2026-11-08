@@ -2,9 +2,10 @@ import { clamp, type DecisionDef, type EraContext } from '@lifegame/core';
 import type { Bot, DecisionOption, Region, Sex } from '@lifegame/schema';
 import {
   EDU_RANK, JOBS, LIVING_COST, MAJORS, PLACES, REGION_NAME, TIMELINE,
-  declineReason, housePrice, jobTrend, majorHeat, wageIndex, type JobDef, type Major,
+  declineReason, housePrice, jobTrend, majorHeat, money, wageIndex, type JobDef, type Major,
 } from './data.js';
 import { EDU_LABEL, createChildBot } from './bots.js';
+import { lifeEvent } from './events.js';
 
 export interface Modifiers {
   layoff: number;
@@ -172,10 +173,18 @@ function netWorth(bot: Bot): number {
   return bot.state.wealth + (bot.state.vars.assets ?? 0) - (bot.state.vars.debt ?? 0);
 }
 
-function money(n: number): string {
-  if (Math.abs(n) >= 1e8) return `${(n / 1e8).toFixed(1)}亿元`;
-  if (Math.abs(n) >= 1e4) return `${(n / 1e4).toFixed(1)}万元`;
-  return `${Math.round(n)}元`;
+/** 把一个人的大事也写进亲人的人生：父母、兄弟姐妹、祖父母都会记得 */
+function tell(ctx: EraContext, ids: string[], importance: number, mood: number, text: (p: Bot) => string, related: string[]): void {
+  for (const id of ids) {
+    const p = ctx.bot(id);
+    if (!p || p.deathTick !== undefined) continue;
+    p.state.happiness = clamp(p.state.happiness + mood, 0, 100);
+    ctx.log({ type: 'family', botId: p.id, relatedIds: related, importance, text: text(p) });
+  }
+}
+
+function kin(b: Bot): string {
+  return b.sex === 'male' ? '儿子' : '女儿';
 }
 
 function opt(id: string, label: string, description: string, weight: number): DecisionOption {
@@ -337,6 +346,10 @@ function gaokao(bot: Bot, ctx: EraContext): void {
       ? `${ctx.year}年高考放榜，${bot.name}落榜了。`
       : `${ctx.year}年高考放榜，${bot.name}考上了${tierName}（${tier}）。`,
   });
+  const top = tier === '985' || tier === '211';
+  tell(ctx, bot.parentIds, top ? 6 : 5, tier === '落榜' ? -5 : top ? 8 : tier === '专科' ? 1 : 4, (p) => (tier === '落榜'
+    ? `${p.name}的${kin(bot)}${bot.name}高考落榜了，${p.name}好几天没睡好觉。`
+    : `${p.name}的${kin(bot)}${bot.name}考上了${tierName}${top ? '，亲戚邻居都来道喜' : ''}。`), [bot.id]);
   const options: DecisionOption[] = [];
   if (tier !== '落榜') {
     options.push(opt(`go:${tier}`, `去读${tierName}`, '按部就班，踏进大学校门。', 4));
@@ -648,6 +661,9 @@ function doMarry(bot: Bot, partner: Bot, ctx: EraContext): void {
   const text = `${bot.name}和${partner.name}结婚了。`;
   ctx.log({ type: 'marriage', botId: bot.id, relatedIds: [partner.id], importance: 9, text });
   ctx.log({ type: 'marriage', botId: partner.id, relatedIds: [bot.id], importance: 9, text });
+  for (const [x, y] of [[bot, partner], [partner, bot]]) {
+    tell(ctx, x.parentIds, 6, 6, (p) => `${p.name}的${kin(x)}${x.name}${x.sex === 'male' ? '娶了' : '嫁给了'}${y.name}。`, [x.id, y.id]);
+  }
 }
 
 function allowedChildren(ctx: EraContext, bot: Bot): number {
@@ -851,6 +867,10 @@ export function onTick(bot: Bot, ctx: EraContext): void {
       child.relationships.push({ botId: bot.id, kind: 'parent', affinity: 80, sinceTick: ctx.tick }, { botId: father.id, kind: 'parent', affinity: 80, sinceTick: ctx.tick });
       bot.state.happiness = clamp(bot.state.happiness + 12, 0, 100);
       father.state.happiness = clamp(father.state.happiness + 12, 0, 100);
+      const older = bot.childrenIds.filter((id) => id !== child.id);
+      tell(ctx, older, 5, 2, (s) => `${s.name}有了一个${sex === 'male' ? '弟弟' : '妹妹'}${child.name}。`, [child.id]);
+      tell(ctx, father.parentIds, 6, 8, (g) => `${g.name}抱上了${sex === 'male' ? '孙子' : '孙女'}${child.name}。`, [child.id]);
+      tell(ctx, bot.parentIds, 6, 8, (g) => `${g.name}抱上了${sex === 'male' ? '外孙' : '外孙女'}${child.name}。`, [child.id]);
       const text = `${bot.name}和${father.name}的${sex === 'male' ? '儿子' : '女儿'}${child.name}出生了。`;
       ctx.log({ type: 'child', botId: bot.id, relatedIds: [father.id, child.id], importance: 9, text });
       ctx.log({ type: 'child', botId: father.id, relatedIds: [bot.id, child.id], importance: 9, text });
@@ -870,75 +890,13 @@ export function onTick(bot: Bot, ctx: EraContext): void {
   st.happiness = clamp(st.happiness + (baseline - st.happiness) * 0.06, 0, 100);
 
   // 月度随机事件
-  if (rng.chance(0.05)) randomEvent(bot, age, ctx);
+  if (rng.chance(0.05)) lifeEvent(bot, ctx);
 
   // 主播/骑手等平台职业的收入波动
   if (st.job?.id === 'streamer' && ctx.month === 6) {
     if (rng.chance(0.08)) { const gain = st.job.salary * rng.range(30, 200); st.wealth += gain; ctx.log({ type: 'money', botId: bot.id, importance: 8, text: `${bot.name}的账号突然爆了，一年打赏和带货赚了${money(gain)}。` }); }
     else if (rng.chance(0.3)) { st.job.salary = Math.round(st.job.salary * 0.6); ctx.log({ type: 'money', botId: bot.id, importance: 4, text: `${bot.name}的直播间越来越冷清。` }); }
   }
-}
-
-/** 花掉/亏掉积蓄的一部分；没有积蓄的人不会因此"减少负债" */
-function spend(b: Bot, factor: number): void {
-  if (b.state.wealth > 0) b.state.wealth *= factor;
-}
-
-interface RandomEventDef {
-  id: string;
-  once?: boolean;
-  cond?: (b: Bot, ctx: EraContext) => boolean;
-  stages: Bot['stage'][];
-  weight: (b: Bot, ctx: EraContext) => number;
-  text: (b: Bot, ctx: EraContext) => string;
-  importance: number;
-  apply?: (b: Bot, ctx: EraContext) => void;
-}
-
-const RANDOM_EVENTS: RandomEventDef[] = [
-  { id: 'top_student', cond: (b) => b.state.tags.includes('student'), stages: ['child'], weight: (b) => b.state.skills.academic / 40, importance: 3, text: (b) => `${b.name}期末考了全班第一，奖状贴满了墙。`, apply: (b) => { b.state.happiness += 5; b.state.skills.academic += 2; } },
-  { id: 'river', stages: ['child'], weight: () => 1, importance: 3, text: (b) => `${b.name}和小伙伴在河边摸鱼，被父母揍了一顿。`, apply: (b) => { b.state.happiness += 2; } },
-  { id: 'child_ill', stages: ['child'], weight: (b) => (100 - b.talents.physique) / 50, importance: 4, text: (b) => `${b.name}大病一场，在医院躺了半个月。`, apply: (b) => { b.state.health -= 8; } },
-  { id: 'left_behind', once: true, stages: ['child', 'teen'], weight: (b, c) => (b.origin.region === 'rural' && b.state.location === 'rural' && c.year > 1995 && c.year < 2015 ? 2 : 0), importance: 5, text: (b) => `${b.name}的父母去外地打工了，${b.name}成了留守儿童。`, apply: (b) => { b.state.happiness -= 8; } },
-  { id: 'gaming', cond: (b) => b.state.tags.includes('student'), stages: ['teen'], weight: (b, c) => (c.year > 2000 ? 1.5 : 0.3), importance: 4, text: (b, c) => `${b.name}沉迷${c.year < 2010 ? '网吧' : '手游'}，成绩一落千丈。`, apply: (b) => { b.state.skills.academic -= 6; } },
-  { id: 'puppy_love', cond: (b) => b.state.tags.includes('student'), stages: ['teen'], weight: (b) => b.talents.charm / 50, importance: 5, text: (b) => `${b.name}早恋了，被老师叫了家长。`, apply: (b) => { b.state.happiness += 4; b.state.skills.academic -= 2; } },
-  { id: 'contest', once: true, cond: (b) => b.state.tags.includes('student'), stages: ['teen'], weight: (b) => b.talents.intellect / 60, importance: 5, text: (b) => `${b.name}在奥数/物理竞赛中拿了奖。`, apply: (b) => { b.state.skills.academic += 6; b.state.happiness += 5; } },
-  { id: 'breakup', stages: ['youth', 'adult'], weight: (b) => (b.spouseId ? 0 : 1.5), importance: 5, text: (b) => `${b.name}失恋了，难过了好一阵。`, apply: (b) => { b.state.happiness -= 10; } },
-  { id: 'blind_date', stages: ['youth', 'adult'], weight: (b) => (b.spouseId ? 0 : 1), importance: 4, text: (b) => `${b.name}被家里安排相亲，场面很尴尬。`, apply: (b) => { b.state.happiness -= 2; } },
-  { id: 'scolded', cond: (b) => !!b.state.job && JOBS.find((j) => j.id === b.state.job!.id)!.prestige >= 35, stages: ['youth', 'adult', 'middle'], weight: (b) => (b.state.job ? 1 : 0), importance: 4, text: (b) => `${b.name}被领导当众批评，憋了一肚子气。`, apply: (b) => { b.state.happiness -= 5; } },
-  { id: 'bonus', cond: (b) => !!b.state.job && JOBS.find((j) => j.id === b.state.job!.id)!.prestige >= 35, stages: ['youth', 'adult', 'middle'], weight: (b) => (b.state.job ? 0.8 : 0), importance: 5, text: (b) => `${b.name}做成了一个大项目，拿到一笔不小的奖金。`, apply: (b, c) => { b.state.wealth += (b.state.job?.salary ?? 0) * 3; b.state.happiness += 6; void c; } },
-  { id: 'scam', stages: ['youth', 'adult'], weight: (b, c) => (c.year > 2005 ? 0.6 : 0.2), importance: 6, text: (b, c) => `${b.name}被${c.year > 2015 ? '网络诈骗' : '传销'}骗走了一大笔积蓄。`, apply: (b) => { spend(b, 0.5); b.state.happiness -= 12; } },
-  { id: 'lottery', stages: ['youth', 'adult', 'middle'], weight: (b) => b.talents.luck / 80, importance: 6, text: (b, c) => `${b.name}买彩票中了${c.year < 2000 ? '五千' : '五万'}块。`, apply: (b, c) => { b.state.wealth += 50 * es(c).wageIndex * 10; b.state.happiness += 8; } },
-  { id: 'invest', stages: ['youth', 'adult', 'middle'], weight: (b, c) => (c.year >= 2000 && c.year <= 2020 && b.state.location !== 'rural' ? 0.8 : 0), importance: 5, text: (b, c) => `${b.name}跟风${c.year < 2010 ? '炒股' : c.year < 2018 ? '买基金' : '买理财'}，${b.talents.luck > 55 ? '小赚一笔' : '亏了不少'}。`, apply: (b) => { spend(b, b.talents.luck > 55 ? 1.15 : 0.85); } },
-  { id: 'father_ill', once: true, stages: ['adult', 'middle'], weight: () => 1.2, importance: 7, text: (b) => `${b.name}的父亲病重，${b.name}在医院陪护了几个月，花光了积蓄。`, apply: (b) => { spend(b, 0.6); b.state.happiness -= 10; b.state.health -= 3; } },
-  { id: 'mother_dies', once: true, stages: ['adult', 'middle'], weight: () => 1.0, importance: 8, text: (b) => `${b.name}的母亲去世了。`, apply: (b) => { b.state.happiness -= 15; } },
-  { id: 'school_pull', stages: ['adult', 'middle'], weight: (b) => (b.childrenIds.length ? 1 : 0), importance: 5, text: (b) => `${b.name}为了孩子上学的事四处托关系。`, apply: (b) => { spend(b, 0.95); b.state.happiness -= 3; } },
-  { id: 'fight', stages: ['adult', 'middle'], weight: (b) => (b.spouseId ? 0.5 : 0), importance: 6, text: (b) => `${b.name}和伴侣大吵一架，差点离婚。`, apply: (b) => { b.state.happiness -= 8; } },
-  { id: 'checkup', once: true, stages: ['middle'], weight: (b) => (100 - b.state.health) / 40, importance: 7, text: (b) => `${b.name}体检查出${['高血压', '糖尿病', '脂肪肝', '腰椎间盘突出'][Math.floor(b.talents.luck / 26)]}，不得不开始养生。`, apply: (b) => { b.state.health -= 6; } },
-  { id: 'reunion', stages: ['middle', 'senior'], weight: () => 0.6, importance: 5, text: (b) => `${b.name}和多年不见的老同学聚会，感慨万千。`, apply: (b) => { b.state.happiness += 4; } },
-  { id: 'grandkids', stages: ['senior'], weight: (b) => (b.childrenIds.length ? 1.5 : 0), importance: 4, text: (b) => `${b.name}开始帮儿女带孙辈，每天接送上下学。`, apply: (b) => { b.state.happiness += 3; } },
-  { id: 'square_dance', stages: ['senior'], weight: () => 1, importance: 3, text: (b, c) => `${b.name}${c.year > 2010 ? '迷上了广场舞' : '每天早上去公园打太极'}。`, apply: (b) => { b.state.health += 2; b.state.happiness += 3; } },
-  { id: 'fall', stages: ['senior'], weight: (b) => (100 - b.state.health) / 30, importance: 7, text: (b) => `${b.name}摔了一跤，住院做了手术。`, apply: (b) => { b.state.health -= 12; spend(b, 0.85); } },
-  { id: 'health_scam', stages: ['senior'], weight: (b, c) => (c.year > 2015 ? 0.8 : 0), importance: 6, text: (b) => `${b.name}被保健品推销员骗了好几万。`, apply: (b) => { spend(b, 0.8); b.state.happiness -= 6; } },
-];
-
-function randomEvent(bot: Bot, age: number, ctx: EraContext): void {
-  void age;
-  if (ctx.tick - (bot.state.vars.lastEventTick ?? -99) < 7) return;
-  const pool = RANDOM_EVENTS.filter((e) =>
-    e.stages.includes(bot.stage)
-    && (!e.once || !hasTag(bot, `ev:${e.id}`))
-    && (!e.cond || e.cond(bot, ctx))
-    && e.weight(bot, ctx) > 0);
-  if (!pool.length) return;
-  const ev = ctx.rng.weighted(pool, (e) => e.weight(bot, ctx));
-  bot.state.vars.lastEventTick = ctx.tick;
-  if (ev.once) tag(bot, `ev:${ev.id}`);
-  ev.apply?.(bot, ctx);
-  bot.state.happiness = clamp(bot.state.happiness, 0, 100);
-  bot.state.health = clamp(bot.state.health, 1, 100);
-  bot.state.skills.academic = clamp(bot.state.skills.academic, 0, 100);
-  ctx.log({ type: 'misc', botId: bot.id, importance: ev.importance, text: ev.text(bot, ctx) });
 }
 
 // ---------- 决策落地 ----------

@@ -290,7 +290,21 @@ export class World {
   private takePending(): DecisionNode[] {
     const p = this.stepPending.filter((n) => n.chosen === undefined);
     this.stepPending = [];
+    for (const n of p) n.asOf ??= this.contextOf(n);
     return p;
+  }
+
+  /** 记下提出这一步结束时的处境，重放到同一步会得到同样的一份 */
+  private contextOf(node: DecisionNode): DecisionNode['asOf'] {
+    const bot = this.state.bots[node.botId];
+    if (!bot) return undefined;
+    return {
+      log: this.state.log.length,
+      situation: this.era.situationCard(bot, this.ctx),
+      era: this.era.eraCard(this.ctx),
+      persona: this.era.personaCard(bot, this.ctx),
+      goal: bot.goal,
+    };
   }
 
   /** 按提出顺序落地到期的决策；落地时可能连锁提出新的决策 */
@@ -362,6 +376,8 @@ export class World {
 
   private applyDecision(node: DecisionNode): void {
     node.applied = true;
+    node.appliedSeq = this.state.log.length;
+    delete node.asOf;
     this.state.openDecisionIds = this.state.openDecisionIds.filter((p) => p !== node.id);
     if (node.provisional) this.state.provisionalIds.push(node.id);
     const bot = this.state.bots[node.botId];
@@ -685,6 +701,26 @@ export class World {
             self.log({ type: 'marriage', botId: sp.id, relatedIds: [bot.id], importance: 8, text: `${sp.name}的伴侣${bot.name}去世了。` });
             sp.state.happiness = Math.max(0, sp.state.happiness - 25);
           }
+        }
+        // 父母和子女也会知道
+        for (const pid of bot.parentIds) {
+          const p = self.state.bots[pid];
+          if (!p || p.deathTick !== undefined) continue;
+          p.state.happiness = Math.max(0, p.state.happiness - (age < 50 ? 30 : 20));
+          self.log({
+            type: 'family', botId: p.id, relatedIds: [bot.id], importance: 8,
+            text: `${p.name}的${bot.sex === 'male' ? '儿子' : '女儿'}${bot.name}${cause}，${age < 50 ? `年仅${age}岁，白发人送黑发人。` : `终年${age}岁。`}`,
+          });
+        }
+        for (const cid of bot.childrenIds) {
+          const c = self.state.bots[cid];
+          if (!c || c.deathTick !== undefined) continue;
+          const young = ageAt(c.birthTick, self.ctx.tick) < 18;
+          c.state.happiness = Math.max(0, c.state.happiness - (young ? 25 : 12));
+          self.log({
+            type: 'family', botId: c.id, relatedIds: [bot.id], importance: young ? 8 : 7,
+            text: `${c.name}的${bot.sex === 'male' ? '父亲' : '母亲'}${bot.name}${cause}，终年${age}岁。`,
+          });
         }
       },
     };

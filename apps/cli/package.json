@@ -7,7 +7,8 @@
     "start": "tsx src/main.ts",
     "build": "tsc -b",
     "live": "tsx src/live.ts",
-    "jobs": "tsx src/jobs.ts"
+    "jobs": "tsx src/jobs.ts",
+    "events": "tsx src/events.ts"
   },
   "dependencies": {
     "@lifegame/core": "workspace:*",
