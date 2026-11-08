@@ -329,6 +329,7 @@ function makeSave(): SaveFile {
     active: active.info.id,
     compare: active.info.parentId,
     branches: saved,
+    rules: mw.era.rulesVersion ?? 1,
     meta: {
       year: mw.state.config.startYear + Math.floor(display / 12),
       heroes: Object.values(world(active).state.bots).filter((b) => b.lead).map((b) => b.name),
@@ -370,7 +371,10 @@ function load(file: SaveFile, settings: BrainSettings): void {
   }
   activeId = branches.has(file.active) ? file.active : file.branches[0].info.id;
   const display = displayAt.get(activeId) ?? 0;
-  post({ type: 'loaded', active: activeId, compare: file.compare && branches.has(file.compare) ? file.compare : undefined, year: file.config.startYear + Math.floor(display / 12) });
+  post({
+    type: 'loaded', active: activeId, compare: file.compare && branches.has(file.compare) ? file.compare : undefined,
+    year: file.config.startYear + Math.floor(display / 12), staleRules: (file.rules ?? 1) !== (era.rulesVersion ?? 1),
+  });
   void loop();
   wake();
 }

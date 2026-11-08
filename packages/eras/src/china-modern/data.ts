@@ -98,7 +98,61 @@ export const JOBS: JobDef[] = [
   { id: 'founder', title: '创业者', sector: '创业', base: 60, minEdu: 2, from: 1992, prestige: 50, stress: 85 },
   { id: 'soldier', title: '军人', sector: '军队', base: 55, minEdu: 2, prestige: 60, stress: 50 },
   { id: 'streamer', title: '主播', sector: '平台经济', base: 110, minEdu: 2, from: 2016, prestige: 30, stress: 55 },
+  { id: 'ai', title: 'AI 工程师', sector: '人工智能', base: 230, minEdu: 6, from: 2024, majors: ['计算机', '工科'], regions: ['city', 'metro'], prestige: 75, stress: 70 },
+  { id: 'carer', title: '养老护理员', sector: '养老', base: 75, minEdu: 1, from: 2025, prestige: 25, stress: 55 },
 ];
+
+/**
+ * 各职业随年代的兴衰：[年份, 需求, 工资]，年份之间线性插值，两端外推取端点值。
+ * 需求影响找到这份工作的机会和被裁的风险；工资是相对"全国工资指数"的倍数。
+ * 2026 年以后的部分是推演：AI 接手写代码、做设计、记账、写稿；机器人进工厂；无人车上路；老龄化让护理最缺人。
+ */
+const JOB_TRENDS: Record<string, Array<[number, number, number]>> = {
+  programmer: [[1996, 0.7, 1.0], [2000, 1.1, 1.15], [2010, 1.4, 1.3], [2018, 1.3, 1.35], [2022, 0.9, 1.15], [2026, 0.6, 0.95], [2030, 0.22, 0.7], [2040, 0.12, 0.6]],
+  pm: [[2008, 1.0, 1.0], [2015, 1.3, 1.2], [2022, 0.8, 1.05], [2026, 0.6, 0.9], [2030, 0.25, 0.75], [2040, 0.2, 0.7]],
+  clerk: [[2020, 1.0, 1.0], [2026, 0.8, 0.95], [2032, 0.35, 0.8], [2045, 0.25, 0.75]],
+  accountant: [[2020, 1.0, 1.0], [2026, 0.85, 0.95], [2032, 0.4, 0.8], [2045, 0.3, 0.75]],
+  designer: [[2020, 1.0, 1.0], [2026, 0.75, 0.9], [2032, 0.4, 0.75], [2045, 0.35, 0.7]],
+  media: [[2020, 1.0, 1.0], [2026, 0.75, 0.9], [2032, 0.45, 0.8], [2045, 0.4, 0.75]],
+  finance: [[1992, 1.0, 1.0], [2016, 1.2, 1.1], [2022, 0.9, 1.0], [2030, 0.6, 0.9], [2045, 0.5, 0.85]],
+  lawyer: [[2026, 1.0, 1.0], [2035, 0.7, 0.9], [2050, 0.6, 0.85]],
+  sales: [[2030, 1.0, 1.0], [2040, 0.8, 0.95]],
+  factory: [[1980, 1.0, 1.0], [2001, 1.4, 1.0], [2008, 1.4, 1.0], [2009, 0.9, 1.0], [2015, 0.9, 1.05], [2025, 0.7, 1.05], [2040, 0.45, 1.0], [2060, 0.35, 1.0]],
+  migrant: [[1985, 1.0, 1.0], [2001, 1.4, 1.0], [2015, 1.0, 1.05], [2025, 0.8, 1.05], [2040, 0.6, 1.0]],
+  soe: [[1996, 1.0, 1.0], [1997, 0.4, 0.85], [2001, 0.4, 0.85], [2003, 1.0, 1.0]],
+  teacher: [[2018, 1.0, 1.0], [2025, 0.85, 1.0], [2035, 0.6, 1.0], [2050, 0.5, 1.0]],
+  nurse: [[2020, 1.0, 1.0], [2030, 1.4, 1.15], [2045, 1.6, 1.25]],
+  doctor: [[2025, 1.0, 1.0], [2035, 1.2, 1.1]],
+  rider: [[2015, 1.2, 1.0], [2022, 1.2, 0.9], [2030, 0.7, 0.85], [2040, 0.35, 0.8]],
+  driver: [[2025, 1.0, 1.0], [2032, 0.6, 0.9], [2045, 0.3, 0.8]],
+  ai: [[2024, 0.6, 1.0], [2028, 1.0, 1.1], [2035, 0.9, 1.0], [2050, 0.7, 0.9]],
+  carer: [[2025, 0.8, 1.0], [2030, 1.5, 1.15], [2045, 1.8, 1.3]],
+};
+
+export function jobTrend(jobId: string, year: number): { demand: number; pay: number } {
+  const pts = JOB_TRENDS[jobId];
+  if (!pts) return { demand: 1, pay: 1 };
+  if (year <= pts[0][0]) return { demand: pts[0][1], pay: pts[0][2] };
+  for (let i = 1; i < pts.length; i++) {
+    if (year <= pts[i][0]) {
+      const [y0, d0, p0] = pts[i - 1];
+      const [y1, d1, p1] = pts[i];
+      const k = (year - y0) / (y1 - y0);
+      return { demand: d0 + (d1 - d0) * k, pay: p0 + (p1 - p0) * k };
+    }
+  }
+  const last = pts[pts.length - 1];
+  return { demand: last[1], pay: last[2] };
+}
+
+/** 这一行为什么在萎缩（用于失业的叙述） */
+export function declineReason(jobId: string, year: number): string | undefined {
+  if (year >= 2026 && ['programmer', 'pm', 'clerk', 'accountant', 'designer', 'media', 'finance', 'lawyer'].includes(jobId)) return 'AI 接手了这份工作的大部分活';
+  if (year >= 2025 && (jobId === 'factory' || jobId === 'migrant')) return '厂里换上了机器人';
+  if (year >= 2030 && (jobId === 'driver' || jobId === 'rider')) return '无人车接走了大部分单子';
+  if (year >= 2025 && jobId === 'teacher') return '生源越来越少，学校在并班';
+  return undefined;
+}
 
 export const MAJORS = ['计算机', '金融', '医学', '师范', '工科', '文科', '艺术'] as const;
 export type Major = (typeof MAJORS)[number];
@@ -106,9 +160,9 @@ export type Major = (typeof MAJORS)[number];
 /** 各专业热度随年份变化（权重倍数） */
 export function majorHeat(major: Major, year: number): number {
   switch (major) {
-    case '计算机': return year < 1998 ? 0.4 : year < 2010 ? 1.2 : 2.2;
-    case '金融': return year < 1995 ? 0.5 : year < 2016 ? 1.8 : 1.2;
-    case '医学': return 1.0;
+    case '计算机': return year < 1998 ? 0.4 : year < 2010 ? 1.2 : year < 2024 ? 2.2 : year < 2030 ? 1.2 : 0.7;
+    case '金融': return year < 1995 ? 0.5 : year < 2016 ? 1.8 : year < 2026 ? 1.2 : 0.8;
+    case '医学': return year < 2025 ? 1.0 : 1.6;
     case '师范': return year < 2000 ? 1.3 : year < 2018 ? 0.7 : 1.3;
     case '工科': return 1.4;
     case '文科': return 1.0;
@@ -178,7 +232,8 @@ export const TIMELINE: TimelineEvent[] = [
   { year: 2020, id: 'covid', title: '新冠疫情', text: '封控、核酸、远程办公成为日常，服务业与小企业受创最重。', duration: 3 },
   { year: 2021, id: 'double-reduction', title: '双减与三孩', text: '校外培训行业一夜归零，互联网大厂开始裁员，35 岁成为职场隐形门槛；同年放开三孩。', duration: 3 },
   { year: 2023, id: 'post-covid', title: '疫情后复苏乏力', text: '青年失业率高企，考公考编人数创纪录，房价开始下行。', duration: 3 },
-  { year: 2026, id: 'ai-wave', title: 'AI 浪潮', text: '大模型进入各行各业，部分白领岗位被替代，新职业涌现。', duration: 10, speculative: true },
-  { year: 2030, id: 'aging', title: '深度老龄化', text: '60 岁以上人口超过三成，延迟退休全面落地，养老成为家庭核心议题。', duration: 30, speculative: true },
+  { year: 2026, id: 'ai-wave', title: 'AI 浪潮', text: 'AI 能写代码、做设计、记账、写稿，程序员、文员、会计、设计师的岗位大量消失，留下的工资也在跌；只有极少数做 AI 的人收入暴涨。', duration: 10, speculative: true },
+  { year: 2030, id: 'aging', title: '深度老龄化', text: '60 岁以上人口超过三成，延迟退休全面落地，养老成为家庭核心议题，护士和养老护理员成了最缺人的行业。', duration: 30, speculative: true },
+  { year: 2032, id: 'driverless', title: '无人驾驶普及', text: '无人车和无人配送铺开，司机和外卖骑手的单子越来越少。', duration: 15, speculative: true },
   { year: 2040, id: 'silver', title: '银发经济时代', text: '机器人护理与社区养老普及，年轻劳动力稀缺，工资持续上涨。', duration: 20, speculative: true },
 ];

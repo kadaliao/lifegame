@@ -1,7 +1,7 @@
 import type { EraContext, EraPack } from '@lifegame/core';
 import type { Bot, LifeStage } from '@lifegame/schema';
 import { EDU_LABEL, createChildBot, createCustomBot, createInitialBot, personaCard } from './bots.js';
-import { PARENT_JOBS, PLACES, REGION_NAME, TIMELINE, wageIndex } from './data.js';
+import { PARENT_JOBS, PLACES, REGION_NAME, TIMELINE, declineReason, jobTrend, wageIndex } from './data.js';
 import { checkDischarge, decisions, es, initEraState, onBirthday, onTick, onYear } from './life.js';
 
 function money(n: number): string {
@@ -12,6 +12,8 @@ function money(n: number): string {
 
 export const chinaModern: EraPack = {
   id: 'china-modern',
+  // 2：各职业随年代兴衰（AI 浪潮、自动化、老龄化）
+  rulesVersion: 2,
   name: '当代中国 1980–2060',
   description: '从改革开放到深度老龄化。高考、下海、下岗、房贷、互联网、疫情、考公、AI——一代人的八十年。',
   defaultStartYear: 1980,
@@ -58,11 +60,15 @@ export const chinaModern: EraPack = {
     lines.push(`现在是${ctx.year}年，${bot.name}${age}岁，住在${st.city}（${REGION_NAME[st.location]}）。`);
     const parts: string[] = [];
     parts.push(`学历${EDU_LABEL[st.education]}`);
-    if (st.job) parts.push(`职业${st.job.title}，月薪${st.job.salary}元`);
+    if (st.job) {
+      const trend = jobTrend(st.job.id, ctx.year);
+      const why = trend.demand < 0.6 ? declineReason(st.job.id, ctx.year) : undefined;
+      parts.push(`职业${st.job.title}，月薪${st.job.salary}元${why ? `（这一行在萎缩：${why}，身边不断有人被裁）` : trend.demand > 1.3 ? '（这一行正缺人）' : ''}`);
+    }
     else if (st.tags.includes('student')) parts.push('在读学生');
     else if (st.tags.includes('retired')) parts.push(`已退休，月领养老金${st.vars.pension ?? 0}元`);
     else if (age >= 16) parts.push('目前没有工作');
-    parts.push(`存款${money(st.wealth)}`);
+    parts.push(st.wealth >= 0 ? `存款${money(st.wealth)}` : `欠债${money(-st.wealth)}`);
     if (st.ownsHome) parts.push(`有房${st.vars.debt ? `，房贷还剩${money(st.vars.debt)}` : ''}`);
     else if (age >= 22) parts.push('租房');
     lines.push(parts.join('，') + '。');

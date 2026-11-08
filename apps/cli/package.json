@@ -6,7 +6,8 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "build": "tsc -b",
-    "live": "tsx src/live.ts"
+    "live": "tsx src/live.ts",
+    "jobs": "tsx src/jobs.ts"
   },
   "dependencies": {
     "@lifegame/core": "workspace:*",

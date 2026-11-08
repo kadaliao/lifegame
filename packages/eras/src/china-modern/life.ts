@@ -2,7 +2,7 @@ import { clamp, type DecisionDef, type EraContext } from '@lifegame/core';
 import type { Bot, DecisionOption, Region, Sex } from '@lifegame/schema';
 import {
   EDU_RANK, JOBS, LIVING_COST, MAJORS, PLACES, REGION_NAME, TIMELINE,
-  housePrice, majorHeat, wageIndex, type JobDef, type Major,
+  declineReason, housePrice, jobTrend, majorHeat, wageIndex, type JobDef, type Major,
 } from './data.js';
 import { EDU_LABEL, createChildBot } from './bots.js';
 
@@ -97,7 +97,7 @@ export function onYear(ctx: EraContext): void {
 function salaryFor(job: JobDef, bot: Bot, level: number, ctx: EraContext): number {
   const s = es(ctx);
   const skillF = 0.85 + (bot.state.skills.academic + bot.state.skills.social + bot.state.skills.business) / 600;
-  return Math.round(job.base * s.wageIndex * REGION_MULT[bot.state.location] * (1 + level * 0.18) * skillF);
+  return Math.round(job.base * s.wageIndex * REGION_MULT[bot.state.location] * (1 + level * 0.18) * skillF * jobTrend(job.id, ctx.year).pay);
 }
 
 function pickJob(bot: Bot, ctx: EraContext, prefer?: (j: JobDef) => number): JobDef | undefined {
@@ -120,9 +120,28 @@ function pickJob(bot: Bot, ctx: EraContext, prefer?: (j: JobDef) => number): Job
     if (edu - j.minEdu >= 2) w *= 0.6;
     if (bot.values.security > 65 && (j.id === 'civil' || j.id === 'soe' || j.id === 'teacher')) w *= 1.8;
     if (bot.values.ambition > 65 && j.base > 100) w *= 1.6;
+    // 这一行在扩张还是萎缩
+    w *= jobTrend(j.id, year).demand;
     if (prefer) w *= prefer(j);
     return w;
   });
+}
+
+/** 这份工作此刻有多好找：行业需求 × 全局招聘景气 */
+function hireChance(job: JobDef, ctx: EraContext): number {
+  return clamp(0.3 + 0.65 * jobTrend(job.id, ctx.year).demand * es(ctx).modifiers.hiring, 0.08, 0.98);
+}
+
+/** 找工作：最多投三家，行情差的行业常常落空 */
+function tryHire(bot: Bot, ctx: EraContext, prefer?: (j: JobDef) => number, attempts = 3): boolean {
+  for (let i = 0; i < attempts; i++) {
+    const job = pickJob(bot, ctx, prefer);
+    if (!job) break;
+    if (ctx.rng.chance(hireChance(job, ctx))) { giveJob(bot, job, ctx); return true; }
+  }
+  bot.state.vars.unemployedSince = ctx.tick;
+  ctx.log({ type: 'job', botId: bot.id, importance: 5, text: `${bot.name}投了很多份简历，暂时没找到工作。` });
+  return false;
 }
 
 function giveJob(bot: Bot, job: JobDef, ctx: EraContext, note?: string): void {
@@ -195,7 +214,7 @@ export function onBirthday(bot: Bot, age: number, ctx: EraContext): void {
         giveJob(bot, JOBS.find((j) => j.id === jobId)!, ctx);
       } else {
         const job = pickJob(bot, ctx);
-        if (job && rng.chance(0.75 * m.hiring)) giveJob(bot, job, ctx);
+        if (job && rng.chance(0.8 * hireChance(job, ctx))) giveJob(bot, job, ctx);
       }
     }
   }
@@ -362,9 +381,9 @@ function enroll(bot: Bot, tier: string, ctx: EraContext): void {
 
 function majorBlurb(mj: Major, year: number): string {
   switch (mj) {
-    case '计算机': return year < 2000 ? '新兴专业，前景不明。' : year < 2012 ? '互联网正在起飞，程序员很吃香。' : '大厂高薪，但卷得厉害，35 岁是道坎。';
-    case '金融': return year < 2015 ? '金融是最赚钱的行业。' : '光环褪去，但依然体面。';
-    case '医学': return '学制长、很辛苦，但越老越吃香。';
+    case '计算机': return year < 2000 ? '新兴专业，前景不明。' : year < 2012 ? '互联网正在起飞，程序员很吃香。' : year < 2024 ? '大厂高薪，但卷得厉害，35 岁是道坎。' : 'AI 已经会写代码了，普通程序员的岗位越来越少；读到硕士做 AI 的除外。';
+    case '金融': return year < 2015 ? '金融是最赚钱的行业。' : year < 2026 ? '光环褪去，但依然体面。' : '算账、做报告的活 AI 都能干了，岗位在缩。';
+    case '医学': return year < 2025 ? '学制长、很辛苦，但越老越吃香。' : '学制长、很辛苦；老人越来越多，医护是少数不愁工作的行业。';
     case '师范': return year < 2000 ? '包分配，铁饭碗。' : '稳定，有寒暑假。';
     case '工科': return '好就业，进厂进院所都行。';
     case '文科': return '选择面广，但起薪不高。';
@@ -455,13 +474,21 @@ function career(bot: Bot, age: number, ctx: EraContext): void {
   if (def.id === 'soe' && es(ctx).active.includes('laid-off')) layoffP = 0.18;
   if (def.id === 'factory' && es(ctx).active.includes('laid-off')) layoffP = 0.14;
   if ((def.sector === '互联网' || def.sector === '文化传媒') && m.tech35 && age >= 35) layoffP += 0.12;
+  // 行业萎缩，裁员成倍增加
+  const demand = jobTrend(def.id, ctx.year).demand;
+  if (layoffP > 0.005) layoffP *= clamp(1 / demand, 0.6, 5);
   if (def.id === 'founder') layoffP = 0;
   if (rng.chance(layoffP)) {
     bot.state.job = undefined;
     bot.state.vars.unemployedSince = ctx.tick;
+    untag(bot, 'lastjob');
+    tag(bot, `lastjob:${def.id}`);
     bot.state.happiness = clamp(bot.state.happiness - 15, 0, 100);
-    const why = es(ctx).active.includes('laid-off') && (def.id === 'soe' || def.id === 'factory') ? '赶上下岗潮，' : m.tech35 && age >= 35 && def.sector === '互联网' ? '过了 35 岁，' : '';
-    ctx.log({ type: 'job', botId: bot.id, importance: 7, text: `${why}${bot.name}失去了${def.title}的工作。` });
+    const decline = demand < 0.7 ? declineReason(def.id, ctx.year) : undefined;
+    const why = es(ctx).active.includes('laid-off') && (def.id === 'soe' || def.id === 'factory') ? '赶上下岗潮，'
+      : decline ? `${decline}，`
+        : m.tech35 && age >= 35 && def.sector === '互联网' ? '过了 35 岁，' : '';
+    ctx.log({ type: 'job', botId: bot.id, importance: 7, text: `${why}${bot.name}失去了${def.title}的工作。`, data: { lost: def.id } });
     if (age >= 28 && age < m.retireAge - 5) laidOffChoice(bot, age, ctx);
   }
 }
@@ -469,9 +496,14 @@ function career(bot: Bot, age: number, ctx: EraContext): void {
 function laidOffChoice(bot: Bot, age: number, ctx: EraContext): void {
   const y = ctx.year;
   const v = bot.values;
+  const last = tagValue(bot, 'lastjob');
+  const d = last ? jobTrend(last, y).demand : 1;
+  const why = last ? declineReason(last, y) : undefined;
+  const sameDesc = d < 0.4 ? `这一行的岗位已经所剩无几${why ? `（${why}）` : ''}，回去很难。` : d < 0.8 ? '这一行在收缩，回去不容易。' : '轻车熟路，但行情未必好。';
+  const growing = JOBS.filter((j) => (j.from === undefined || y >= j.from) && jobTrend(j.id, y).demand > 1.2 && j.id !== 'founder').map((j) => j.title).slice(0, 3);
   const options: DecisionOption[] = [
-    opt('same', '找同行的工作', '轻车熟路，但行情未必好。', 2),
-    opt('switch', '转行从头来过', '放下身段，重新学。', 0.8 * (bot.personality.openness / 50)),
+    opt('same', '找同行的工作', sameDesc, 2 * d),
+    opt('switch', '转行从头来过', growing.length ? `放下身段，重新学。眼下缺人的是${growing.join('、')}。` : '放下身段，重新学。', 0.8 * (bot.personality.openness / 50) * (d < 0.6 ? 2.5 : 1)),
     opt('home', '回老家', '大城市待不下去了，回去至少有口饭。', 0.7 * (v.family / 50) * (bot.state.location === 'metro' ? 1.5 : 0.5)),
   ];
   if (EDU_RANK[bot.state.education] >= 4 && age <= 35) options.push(opt('civil', '考公务员/事业编', '上岸就不用再担心裁员。', 0.8 * (v.security / 50) * (y > 2015 ? 1.5 : 1)));
@@ -503,7 +535,8 @@ function founderYear(bot: Bot, ctx: EraContext): void {
     bot.state.job!.salary = Math.round(base * rng.range(1, 4));
     if (years >= 1 && rng.chance(0.3)) ctx.log({ type: 'money', botId: bot.id, importance: 3, text: `${bot.name}的小生意不温不火，勉强维持。` });
   } else {
-    const loss = Math.min(bot.state.wealth * rng.range(0.3, 0.9), base * rng.range(10, 80));
+    // 亏损总是正数：有积蓄按积蓄算，没积蓄就是欠下更多的债
+    const loss = bot.state.wealth > 0 ? Math.min(bot.state.wealth * rng.range(0.3, 0.9), base * rng.range(10, 80)) : base * rng.range(5, 30);
     bot.state.wealth -= loss;
     bot.state.job!.salary = Math.round(base * 0.5);
     bot.state.happiness = clamp(bot.state.happiness - 10, 0, 100);
@@ -846,6 +879,11 @@ export function onTick(bot: Bot, ctx: EraContext): void {
   }
 }
 
+/** 花掉/亏掉积蓄的一部分；没有积蓄的人不会因此"减少负债" */
+function spend(b: Bot, factor: number): void {
+  if (b.state.wealth > 0) b.state.wealth *= factor;
+}
+
 interface RandomEventDef {
   id: string;
   once?: boolean;
@@ -869,19 +907,19 @@ const RANDOM_EVENTS: RandomEventDef[] = [
   { id: 'blind_date', stages: ['youth', 'adult'], weight: (b) => (b.spouseId ? 0 : 1), importance: 4, text: (b) => `${b.name}被家里安排相亲，场面很尴尬。`, apply: (b) => { b.state.happiness -= 2; } },
   { id: 'scolded', cond: (b) => !!b.state.job && JOBS.find((j) => j.id === b.state.job!.id)!.prestige >= 35, stages: ['youth', 'adult', 'middle'], weight: (b) => (b.state.job ? 1 : 0), importance: 4, text: (b) => `${b.name}被领导当众批评，憋了一肚子气。`, apply: (b) => { b.state.happiness -= 5; } },
   { id: 'bonus', cond: (b) => !!b.state.job && JOBS.find((j) => j.id === b.state.job!.id)!.prestige >= 35, stages: ['youth', 'adult', 'middle'], weight: (b) => (b.state.job ? 0.8 : 0), importance: 5, text: (b) => `${b.name}做成了一个大项目，拿到一笔不小的奖金。`, apply: (b, c) => { b.state.wealth += (b.state.job?.salary ?? 0) * 3; b.state.happiness += 6; void c; } },
-  { id: 'scam', stages: ['youth', 'adult'], weight: (b, c) => (c.year > 2005 ? 0.6 : 0.2), importance: 6, text: (b, c) => `${b.name}被${c.year > 2015 ? '网络诈骗' : '传销'}骗走了一大笔积蓄。`, apply: (b) => { b.state.wealth *= 0.5; b.state.happiness -= 12; } },
+  { id: 'scam', stages: ['youth', 'adult'], weight: (b, c) => (c.year > 2005 ? 0.6 : 0.2), importance: 6, text: (b, c) => `${b.name}被${c.year > 2015 ? '网络诈骗' : '传销'}骗走了一大笔积蓄。`, apply: (b) => { spend(b, 0.5); b.state.happiness -= 12; } },
   { id: 'lottery', stages: ['youth', 'adult', 'middle'], weight: (b) => b.talents.luck / 80, importance: 6, text: (b, c) => `${b.name}买彩票中了${c.year < 2000 ? '五千' : '五万'}块。`, apply: (b, c) => { b.state.wealth += 50 * es(c).wageIndex * 10; b.state.happiness += 8; } },
-  { id: 'invest', stages: ['youth', 'adult', 'middle'], weight: (b, c) => (c.year >= 2000 && c.year <= 2020 && b.state.location !== 'rural' ? 0.8 : 0), importance: 5, text: (b, c) => `${b.name}跟风${c.year < 2010 ? '炒股' : c.year < 2018 ? '买基金' : '买理财'}，${b.talents.luck > 55 ? '小赚一笔' : '亏了不少'}。`, apply: (b) => { b.state.wealth *= b.talents.luck > 55 ? 1.15 : 0.85; } },
-  { id: 'father_ill', once: true, stages: ['adult', 'middle'], weight: () => 1.2, importance: 7, text: (b) => `${b.name}的父亲病重，${b.name}在医院陪护了几个月，花光了积蓄。`, apply: (b) => { b.state.wealth *= 0.6; b.state.happiness -= 10; b.state.health -= 3; } },
+  { id: 'invest', stages: ['youth', 'adult', 'middle'], weight: (b, c) => (c.year >= 2000 && c.year <= 2020 && b.state.location !== 'rural' ? 0.8 : 0), importance: 5, text: (b, c) => `${b.name}跟风${c.year < 2010 ? '炒股' : c.year < 2018 ? '买基金' : '买理财'}，${b.talents.luck > 55 ? '小赚一笔' : '亏了不少'}。`, apply: (b) => { spend(b, b.talents.luck > 55 ? 1.15 : 0.85); } },
+  { id: 'father_ill', once: true, stages: ['adult', 'middle'], weight: () => 1.2, importance: 7, text: (b) => `${b.name}的父亲病重，${b.name}在医院陪护了几个月，花光了积蓄。`, apply: (b) => { spend(b, 0.6); b.state.happiness -= 10; b.state.health -= 3; } },
   { id: 'mother_dies', once: true, stages: ['adult', 'middle'], weight: () => 1.0, importance: 8, text: (b) => `${b.name}的母亲去世了。`, apply: (b) => { b.state.happiness -= 15; } },
-  { id: 'school_pull', stages: ['adult', 'middle'], weight: (b) => (b.childrenIds.length ? 1 : 0), importance: 5, text: (b) => `${b.name}为了孩子上学的事四处托关系。`, apply: (b) => { b.state.wealth *= 0.95; b.state.happiness -= 3; } },
+  { id: 'school_pull', stages: ['adult', 'middle'], weight: (b) => (b.childrenIds.length ? 1 : 0), importance: 5, text: (b) => `${b.name}为了孩子上学的事四处托关系。`, apply: (b) => { spend(b, 0.95); b.state.happiness -= 3; } },
   { id: 'fight', stages: ['adult', 'middle'], weight: (b) => (b.spouseId ? 0.5 : 0), importance: 6, text: (b) => `${b.name}和伴侣大吵一架，差点离婚。`, apply: (b) => { b.state.happiness -= 8; } },
   { id: 'checkup', once: true, stages: ['middle'], weight: (b) => (100 - b.state.health) / 40, importance: 7, text: (b) => `${b.name}体检查出${['高血压', '糖尿病', '脂肪肝', '腰椎间盘突出'][Math.floor(b.talents.luck / 26)]}，不得不开始养生。`, apply: (b) => { b.state.health -= 6; } },
   { id: 'reunion', stages: ['middle', 'senior'], weight: () => 0.6, importance: 5, text: (b) => `${b.name}和多年不见的老同学聚会，感慨万千。`, apply: (b) => { b.state.happiness += 4; } },
   { id: 'grandkids', stages: ['senior'], weight: (b) => (b.childrenIds.length ? 1.5 : 0), importance: 4, text: (b) => `${b.name}开始帮儿女带孙辈，每天接送上下学。`, apply: (b) => { b.state.happiness += 3; } },
   { id: 'square_dance', stages: ['senior'], weight: () => 1, importance: 3, text: (b, c) => `${b.name}${c.year > 2010 ? '迷上了广场舞' : '每天早上去公园打太极'}。`, apply: (b) => { b.state.health += 2; b.state.happiness += 3; } },
-  { id: 'fall', stages: ['senior'], weight: (b) => (100 - b.state.health) / 30, importance: 7, text: (b) => `${b.name}摔了一跤，住院做了手术。`, apply: (b) => { b.state.health -= 12; b.state.wealth *= 0.85; } },
-  { id: 'health_scam', stages: ['senior'], weight: (b, c) => (c.year > 2015 ? 0.8 : 0), importance: 6, text: (b) => `${b.name}被保健品推销员骗了好几万。`, apply: (b) => { b.state.wealth *= 0.8; b.state.happiness -= 6; } },
+  { id: 'fall', stages: ['senior'], weight: (b) => (100 - b.state.health) / 30, importance: 7, text: (b) => `${b.name}摔了一跤，住院做了手术。`, apply: (b) => { b.state.health -= 12; spend(b, 0.85); } },
+  { id: 'health_scam', stages: ['senior'], weight: (b, c) => (c.year > 2015 ? 0.8 : 0), importance: 6, text: (b) => `${b.name}被保健品推销员骗了好几万。`, apply: (b) => { spend(b, 0.8); b.state.happiness -= 6; } },
 ];
 
 function randomEvent(bot: Bot, age: number, ctx: EraContext): void {
@@ -945,14 +983,12 @@ export const decisions: Record<string, DecisionDef> = {
       switch (choice) {
         case 'metro': {
           moveTo(bot, 'metro', ctx, '去大城市打拼');
-          const job = pickJob(bot, ctx);
-          if (job) giveJob(bot, job, ctx); else bot.state.vars.unemployedSince = ctx.tick;
+          tryHire(bot, ctx);
           break;
         }
         case 'home': {
           moveTo(bot, homeRegion(bot), ctx, '回到老家');
-          const job = pickJob(bot, ctx, (j) => (j.id === 'civil' || j.id === 'teacher' || j.id === 'soe' ? 1.8 : 1));
-          if (job) giveJob(bot, job, ctx); else bot.state.vars.unemployedSince = ctx.tick;
+          tryHire(bot, ctx, (j) => (j.id === 'civil' || j.id === 'teacher' || j.id === 'soe' ? 1.8 : 1));
           break;
         }
         case 'master': {
@@ -965,8 +1001,7 @@ export const decisions: Record<string, DecisionDef> = {
             ctx.log({ type: 'exam', botId: bot.id, importance: 7, text: `${bot.name}考研上岸，继续读研究生。` });
           } else {
             ctx.log({ type: 'exam', botId: bot.id, importance: 6, text: `${bot.name}考研失利，只好先找工作。` });
-            const job = pickJob(bot, ctx);
-            if (job) giveJob(bot, job, ctx); else bot.state.vars.unemployedSince = ctx.tick;
+            tryHire(bot, ctx);
           }
           break;
         }
@@ -976,8 +1011,7 @@ export const decisions: Record<string, DecisionDef> = {
             giveJob(bot, JOBS.find((j) => j.id === 'civil')!, ctx, `${bot.name}考上了公务员，进了${bot.state.city}的机关单位。`);
           } else {
             ctx.log({ type: 'exam', botId: bot.id, importance: 6, text: `${bot.name}考公失利，差了几分。` });
-            const job = pickJob(bot, ctx, (j) => (j.id === 'soe' || j.id === 'teacher' ? 1.5 : 1));
-            if (job) giveJob(bot, job, ctx); else bot.state.vars.unemployedSince = ctx.tick;
+            tryHire(bot, ctx, (j) => (j.id === 'soe' || j.id === 'teacher' ? 1.5 : 1));
           }
           break;
         }
@@ -990,7 +1024,7 @@ export const decisions: Record<string, DecisionDef> = {
     apply(bot, choice, ctx) {
       switch (choice) {
         case 'factory': moveTo(bot, ctx.rng.chance(0.4) ? 'metro' : 'city', ctx, '南下打工'); giveJob(bot, JOBS.find((j) => j.id === (ctx.year < 1985 ? 'migrant' : 'factory'))!, ctx); break;
-        case 'home': { const job = pickJob(bot, ctx); if (job) giveJob(bot, job, ctx); break; }
+        case 'home': tryHire(bot, ctx); break;
         case 'craft': bot.state.skills.craft = clamp(bot.state.skills.craft + 30, 0, 100); moveTo(bot, 'town', ctx, '去县城学手艺'); giveJob(bot, JOBS.find((j) => j.id === 'shop')!, ctx, `${bot.name}学成手艺，在${bot.state.city}开了个小店。`); break;
         case 'army': army(bot, ctx); break;
         case 'rider': moveTo(bot, 'city', ctx, '进城'); giveJob(bot, JOBS.find((j) => j.id === 'rider')!, ctx); break;
@@ -1003,13 +1037,25 @@ export const decisions: Record<string, DecisionDef> = {
     deliberation: 2,
     apply(bot, choice, ctx) {
       switch (choice) {
-        case 'same': { const job = pickJob(bot, ctx); if (job && ctx.rng.chance(0.7 * es(ctx).modifiers.hiring)) giveJob(bot, job, ctx); break; }
-        case 'switch': { bot.state.skills.craft += 5; const job = pickJob(bot, ctx, (j) => (j.sector === '互联网' ? 0.3 : 1.2)); if (job) giveJob(bot, job, ctx); break; }
-        case 'home': { moveTo(bot, homeRegion(bot), ctx, '离开大城市回老家'); const job = pickJob(bot, ctx); if (job) giveJob(bot, job, ctx); break; }
+        case 'same': {
+          // 找原来那一行：行业萎缩时很难
+          const last = tagValue(bot, 'lastjob');
+          const def = JOBS.find((j) => j.id === last);
+          if (def && ctx.rng.chance(0.85 * hireChance(def, ctx) * jobTrend(def.id, ctx.year).demand)) giveJob(bot, def, ctx);
+          else tryHire(bot, ctx, (j) => (j.sector === def?.sector ? 2 : 1), 1);
+          break;
+        }
+        case 'switch': {
+          bot.state.skills.craft += 5;
+          const last = tagValue(bot, 'lastjob');
+          tryHire(bot, ctx, (j) => (j.id === last ? 0.2 : 1.2 * Math.min(1.5, jobTrend(j.id, ctx.year).demand)));
+          break;
+        }
+        case 'home': moveTo(bot, homeRegion(bot), ctx, '离开大城市回老家'); tryHire(bot, ctx); break;
         case 'civil': {
           const p = clamp((bot.state.skills.academic * 0.5 + bot.personality.conscientiousness * 0.3) / 100 * 0.4, 0.05, 0.6);
           if (ctx.rng.chance(p)) giveJob(bot, JOBS.find((j) => j.id === 'civil')!, ctx, `${bot.name}考上了事业编，终于上岸。`);
-          else { ctx.log({ type: 'exam', botId: bot.id, importance: 5, text: `${bot.name}考编失利。` }); const job = pickJob(bot, ctx); if (job) giveJob(bot, job, ctx); }
+          else { ctx.log({ type: 'exam', botId: bot.id, importance: 5, text: `${bot.name}考编失利。` }); tryHire(bot, ctx); }
           break;
         }
         case 'rider': giveJob(bot, JOBS.find((j) => j.id === 'rider')!, ctx, `${bot.name}穿上了黄色的骑手服，开始送外卖。`); break;
@@ -1060,10 +1106,17 @@ function army(bot: Bot, ctx: EraContext): void {
 
 function startFounder(bot: Bot, ctx: EraContext): void {
   tag(bot, 'founder');
-  const seed = Math.min(bot.state.wealth * 0.7, 300 * es(ctx).wageIndex * 10);
-  bot.state.wealth -= seed;
+  const wi = es(ctx).wageIndex;
+  const need = 120 * wi * 10; // 起步本钱，大约是十个月的普通工资
+  const own = clamp(bot.state.wealth * 0.7, 0, 300 * wi * 10);
+  const loan = Math.max(0, need - own);
+  // 借来的钱投进生意，账上记成负债
+  bot.state.wealth -= own + loan;
   bot.state.skills.business += 10;
-  giveJob(bot, JOBS.find((j) => j.id === 'founder')!, ctx, `${bot.name}拿出${money(seed)}积蓄，在${bot.state.city}开始创业。`);
+  const how = own > 0 && loan > 0 ? `拿出${money(own)}积蓄，又找亲戚朋友借了${money(loan)}`
+    : own > 0 ? `拿出${money(own)}积蓄`
+      : `手里没有积蓄，找亲戚朋友借了${money(loan)}`;
+  giveJob(bot, JOBS.find((j) => j.id === 'founder')!, ctx, `${bot.name}${how}，在${bot.state.city}开始创业。`);
 }
 
 /** 服役期满退伍 */

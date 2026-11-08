@@ -577,7 +577,11 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       const br = get().branches[m.active];
       const hero = br && (br.botOrder.map((id) => br.bots[id]).find((b) => b.lead) ?? br.bots[br.botOrder[0]]);
       if (hero) get().selectBot(hero.id);
-      get().flash(`已回到 ${m.year} 年`);
+      if (m.staleRules) {
+        set((s) => ({ errors: [...s.errors, `这份存档来自旧版世界规则，按新规则重放出来的 ${m.year} 年可能和当时看到的不同。想要干净的新世界，点「重开」。`] }));
+      } else {
+        get().flash(`已回到 ${m.year} 年`);
+      }
       break;
     }
     case 'error': set((s) => ({ errors: [...s.errors.slice(-4), m.message] })); break;

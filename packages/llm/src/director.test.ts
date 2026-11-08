@@ -13,10 +13,10 @@ class JitteryMock extends MockProvider {
   }
 }
 
-function makeWorld(opts: { reflections?: boolean; inherit?: boolean } = {}): World {
+function makeWorld(opts: { reflections?: boolean; inherit?: boolean; heroes?: number } = {}): World {
   const w = World.create(chinaModern, { seed: 11, eraId: 'china-modern', population: 70, startYear: 1980, endYear: 2035, birthSpan: 10 });
   w.setFlags({ reflections: opts.reflections ?? false, inherit: opts.inherit ?? false });
-  for (const id of w.state.botOrder.slice(0, 5)) w.setIntelligence(id, 'llm', 'mock/mock', true);
+  for (const id of w.state.botOrder.slice(0, opts.heroes ?? 5)) w.setIntelligence(id, 'llm', 'mock/mock', true);
   return w;
 }
 
@@ -63,8 +63,8 @@ describe('Director', () => {
   }, 60_000);
 
   it('反思与子女继承经由引擎生效：批量运行可重放', async () => {
-    const a = await drive(makeWorld({ reflections: true, inherit: true }), 'patient');
-    const b = await drive(makeWorld({ reflections: true, inherit: true }), 'patient');
+    const a = await drive(makeWorld({ reflections: true, inherit: true, heroes: 12 }), 'patient');
+    const b = await drive(makeWorld({ reflections: true, inherit: true, heroes: 12 }), 'patient');
     const reflections = a.world.state.log.filter((e) => e.type === 'reflection');
     const heirs = Object.values(a.world.state.bots).filter((x) => x.generation > 0 && x.intelligence === 'llm');
     expect(reflections.length).toBeGreaterThan(3);

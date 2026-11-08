@@ -65,6 +65,8 @@ export interface EraTheme {
 
 export interface EraPack {
   id: string;
+  /** 规则版本：改了会影响世界走向的规则就加一，旧存档重放时据此提示 */
+  rulesVersion?: number;
   name: string;
   description: string;
   defaultStartYear: number;

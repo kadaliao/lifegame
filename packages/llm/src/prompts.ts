@@ -1,5 +1,5 @@
 import type { World } from '@lifegame/core';
-import { stageName } from '@lifegame/core';
+import { REFLECT_KIND, stageName } from '@lifegame/core';
 import { tickToYearMonth, type Bot, type DecisionNode, type LifeStage } from '@lifegame/schema';
 import type { LlmMessage } from './provider.js';
 
@@ -45,9 +45,11 @@ export function systemPrompt(world: World, bot: Bot): string {
 
 /** 这个人最近说过的独白，用来避免意象重复 */
 function recentMonologues(world: World, bot: Bot, n = 4): string[] {
+  // 只看已经生效的决定：还在犹豫期里的答案早到晚到取决于网络，放进提示词会让世界随网速变化。
+  // 反思不算（它们已经以"对过去的总结"出现在系统提示里）
   return Object.values(world.state.decisions)
-    .filter((d) => d.botId === bot.id && d.monologue && d.resolvedBy === 'llm')
-    .sort((a, b) => a.tick - b.tick)
+    .filter((d) => d.botId === bot.id && d.applied && d.monologue && d.resolvedBy === 'llm' && d.kind !== REFLECT_KIND)
+    .sort((a, b) => a.seq - b.seq)
     .slice(-n)
     .map((d) => d.monologue!);
 }

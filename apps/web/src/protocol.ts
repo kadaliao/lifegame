@@ -62,6 +62,8 @@ export interface SaveFile {
   compare?: string;
   branches: SavedBranch[];
   meta: { year: number; heroes: string[]; branches: number; eraName: string };
+  /** 存档时的时代规则版本 */
+  rules?: number;
 }
 
 export type WorkerToMain =
@@ -76,7 +78,7 @@ export type WorkerToMain =
   | { type: 'frames'; branchId: string; frames: Record<number, Record<string, number>> }
   | { type: 'yearBots'; branchId: string; years: Record<number, BotSummary[]> }
   | { type: 'saved'; requestId: string; file: SaveFile }
-  | { type: 'loaded'; active: string; compare?: string; year: number }
+  | { type: 'loaded'; active: string; compare?: string; year: number; staleRules: boolean }
   | { type: 'reborn'; branchId: string; botId: string; birthTick: number }
   | { type: 'rewind'; branchId: string; fromSeq: number; fromTick: number }
   | { type: 'usage'; usage: UsageRecord; queue: number }
