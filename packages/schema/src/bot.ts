@@ -120,6 +120,10 @@ export interface Bot {
   model?: string;
   /** 主角：由模型真正拍板，必要时世界停下来等他。配角（如继承了智能的子女）不让世界等 */
   lead?: boolean;
+  /** 这个人自己的随机数流。各人独立，甲的变化不会扰动无关的乙 */
+  rngState?: number[];
+  /** 已提出的决策数，用来生成稳定的决策编号 */
+  decisionCount?: number;
   memory: MemoryEntry[];
   reflections: Reflection[];
   goal?: string;

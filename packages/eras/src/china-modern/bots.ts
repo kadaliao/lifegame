@@ -128,7 +128,7 @@ export function createChildBot(ctx: EraContext, mother: Bot, father: Bot, birthT
     luck: g(rng, 50, 22),
   };
   const values = rollValues(rng, personality, origin);
-  const id = ctx.nextId('b');
+  const id = ctx.childId(mother);
   const family = father.name.length > 2 && !/^[欧上司诸东南西北]/.test(father.name) ? father.name[0] : father.name[0];
   // 避开兄弟姐妹的名字
   const siblingNames = new Set([...mother.childrenIds, ...father.childrenIds].map((cid) => ctx.bot(cid)?.name));
@@ -191,6 +191,6 @@ export function personaCard(bot: Bot, startYear: number): string {
   const tw = talentWords(bot.talents);
   if (tw.length) lines.push(`天赋：${tw.join('，')}。`);
   lines.push(`最看重：${topValues(bot.values).join('、')}。`);
-  if (bot.portrait) lines.push(`自我画像：${bot.portrait}`);
+  // 命运旁白只用于展示，不进提示词：它是异步生成的，进了提示词会让答案依赖网络快慢
   return lines.join('\n');
 }

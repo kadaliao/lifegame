@@ -143,4 +143,20 @@ describe('World', () => {
       expect(w.state.log.length).toBeGreaterThan(500);
     }
   }, 30_000);
+
+  it('局部性：改选一个人的决定，无关的人生大多逐字不变', () => {
+    const w = World.create(chinaModern, { ...cfg, population: 150 });
+    for (const id of w.state.botOrder.slice(0, 10)) w.setIntelligence(id, 'llm');
+    const asked: DecisionNode[] = [];
+    runAll(w, (d) => d.options[0].id, (d) => asked.push(d));
+    const target = asked.find((d) => d.options.length > 1)!;
+    const hero = target.botId;
+    const child = w.fork(target.id, target.options[1].id, 'alt');
+    runAll(child);
+    const lifeOf = (x: World, id: string) => x.state.log.filter((e) => e.botId === id).map((e) => e.text).join('|');
+    const others = w.state.botOrder.filter((id) => id !== hero && w.state.bots[id].generation === 0);
+    const same = others.filter((id) => lifeOf(w, id) === lifeOf(child, id)).length;
+    expect(lifeOf(w, hero)).not.toBe(lifeOf(child, hero));
+    expect(same / others.length).toBeGreaterThan(0.85);
+  });
 });

@@ -13,7 +13,10 @@ export interface DecisionOption {
 export type DecisionResolver = 'rules' | 'llm' | 'user' | 'auto';
 
 export interface DecisionNode {
+  /** 稳定编号：人物编号:第几个决定。无关的人不会因别人的变化而改号 */
   id: string;
+  /** 全局提出顺序，用于同一 tick 内按序落地 */
+  seq: number;
   kind: string;
   /** 提出决策的 tick */
   tick: number;
@@ -32,6 +35,12 @@ export interface DecisionNode {
   model?: string;
   /** 已经落地 */
   applied?: boolean;
+  /** 推测：模型还没答，先按最可能的选择往下走；真答案回来后可能被纠正 */
+  provisional?: boolean;
+  /** 随答案一起生效的新心愿 */
+  goal?: string;
+  /** 提出时发给模型的提示词指纹；重放时只有指纹相同才复用旧答案 */
+  promptKey?: string;
 }
 
 /** 模型对决策的结构化回答 */

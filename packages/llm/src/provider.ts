@@ -37,9 +37,26 @@ export interface Provider {
 /** 单次请求的超时；超时按临时错误处理，由调度器重试 */
 export const REQUEST_TIMEOUT_MS = 45_000;
 
-function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
-  const t = AbortSignal.timeout(ms);
-  return signal ? AbortSignal.any([signal, t]) : t;
+/**
+ * 等一个请求，但取消或超时只是"不再等它"，不去中断底层连接。
+ * Node 自带的 fetch 走 HTTP/2 时，中断在途的流会让 submitRstStream 陷入死循环、把进程卡死；
+ * 已经发出的请求让它自然完成，结果丢掉即可。
+ */
+function giveUpOn<T>(p: Promise<T>, signal: AbortSignal | undefined, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    if (signal?.aborted) { reject(abortErr()); return; }
+    const onAbort = () => { cleanup(); reject(abortErr()); };
+    const timer = setTimeout(() => { cleanup(); reject(new LlmHttpError(`LLM 请求超过 ${ms / 1000} 秒没有回应`, 408)); }, ms);
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    p.then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
+  });
+}
+
+function abortErr(): Error {
+  const e = new Error('aborted');
+  e.name = 'AbortError';
+  return e;
 }
 
 export interface ProviderConfig {
@@ -76,19 +93,21 @@ export class OpenAICompatibleProvider implements Provider {
       max_tokens: req.maxTokens ?? 400,
     };
     if (req.json) body.response_format = { type: 'json_object' };
-    let res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout(signal, REQUEST_TIMEOUT_MS) });
+    const post = () => giveUpOn(
+      fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) }).then(async (r) => ({ r, text: await r.text() })),
+      signal, REQUEST_TIMEOUT_MS,
+    );
+    let { r: res, text: bodyText } = await post();
     if (!res.ok && req.json && res.status === 400) {
       // 有些后端不支持 response_format，去掉重试
       delete body.response_format;
-      res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout(signal, REQUEST_TIMEOUT_MS) });
+      ({ r: res, text: bodyText } = await post());
     }
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
       const ra = Number(res.headers.get('retry-after'));
-      throw new LlmHttpError(`LLM ${res.status}: ${txt.slice(0, 300)}`, res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined);
+      throw new LlmHttpError(`LLM ${res.status}: ${bodyText.slice(0, 300)}`, res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined);
     }
     // 有的服务会在 JSON 字符串里放裸换行，标准解析会失败；把控制字符换成空格再试
-    const bodyText = await res.text();
     let parsed: unknown;
     try { parsed = JSON.parse(bodyText); } catch { parsed = JSON.parse(bodyText.replace(/[\u0000-\u001f]/g, ' ')); }
     const data = parsed as {

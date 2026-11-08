@@ -1,6 +1,25 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "outDir": "dist", "rootDir": "src", "lib": ["ES2022", "DOM"] },
-  "include": ["src"],
-  "references": [{ "path": "../schema" }, { "path": "../core" }]
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ]
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "../schema"
+    },
+    {
+      "path": "../core"
+    }
+  ],
+  "exclude": [
+    "src/**/*.test.ts"
+  ]
 }

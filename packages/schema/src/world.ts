@@ -14,6 +14,13 @@ export interface WorldConfig {
   birthSpan: number;
 }
 
+export interface WorldFlags {
+  /** 智能人格在人生阶段结束时写反思（经由引擎节点生效，保证可重放） */
+  reflections: boolean;
+  /** 智能人格的子女继承智能（作为配角） */
+  inherit: boolean;
+}
+
 export interface WorldSummary {
   tick: number;
   year: number;
@@ -44,6 +51,9 @@ export interface WorldStateShape {
   pendingDecisionIds: string[];
   /** 还没落地的决策（含没有答案的） */
   openDecisionIds: string[];
+  /** 已经按推测落地、等真答案确认的决策 */
+  provisionalIds: string[];
+  flags: WorldFlags;
   /** 时代包的可变全局状态 */
   eraState: Record<string, unknown>;
   nextId: number;

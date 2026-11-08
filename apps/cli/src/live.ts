@@ -1,17 +1,16 @@
 /**
- * 用真模型跑一个世界：
+ * 用真模型跑一个世界（调度逻辑与网页相同，见 @lifegame/llm 的 Director）：
  *   pnpm cli:live -- --model=aihubmix/qwen3-vl-plus --heroes=1 --seed=42
- *   pnpm cli:live -- --heroes=12 --level=1 --quiet     # 压力测试：很多智能人格同时活
- *   pnpm cli:live -- --heroes=12 --leads=3 --speed=2 --quiet
- *       模拟一个 2 年/秒播放的画面：前 3 人是主角（世界可以等他们），
- *       其余和继承来的子女是配角（画面追上时凭直觉选），统计用户实际会看到的停顿。
+ *   pnpm cli:live -- --heroes=12 --leads=3 --speed=2 --level=1 --quiet
+ *       模拟一个 2 年/秒播放的画面：前 3 人是主角，其余和继承来的子女是配角，统计用户实际会看到的停顿。
+ * 不加 --speed 时没有画面，世界总是等模型（从不推测）。
  * 密钥从环境变量读，不会打印。结果写到 runs/。
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { World, stageName } from '@lifegame/core';
 import { getEra } from '@lifegame/eras';
-import { Brain, ENV_PROVIDERS, MockProvider, createProvider, envProviderConfig, type LlmMessage, type Provider } from '@lifegame/llm';
+import { Brain, Director, ENV_PROVIDERS, MockProvider, createProvider, envProviderConfig, favorite, type LlmMessage, type Provider } from '@lifegame/llm';
 import { tickToYearMonth, type DecisionNode, type LifeStage } from '@lifegame/schema';
 
 const args = Object.fromEntries(process.argv.slice(2).filter((a) => a.startsWith('--')).map((a) => {
@@ -30,7 +29,7 @@ const endYear = Number(args.end ?? 2060);
 const concurrency = Number(args.concurrency ?? 4);
 const inherit = args.inherit !== 'false';
 const quiet = args.quiet === 'true';
-/** 画面播放速度（年/秒）；0 表示不模拟画面，世界总是等模型 */
+/** 画面播放速度（年/秒）；0 表示没有画面 */
 const speed = Number(args.speed ?? 0);
 const ahead = speed ? Math.max(60, Math.min(600, Math.round(speed * 12 * 12))) : Infinity;
 
@@ -49,170 +48,120 @@ const brain = new Brain({ providers, defaultModel: { providerId, model }, concur
 
 const era = getEra('china-modern');
 const world = World.create(era, { seed, eraId: era.id, population, startYear: era.defaultStartYear, endYear, birthSpan: era.defaultBirthSpan });
+world.setFlags({ reflections: level >= 2, inherit });
 const order = world.state.botOrder;
 const heroes: string[] = [];
 const step = Math.max(1, Math.floor(order.length / heroCount));
 for (let i = Number(args.hero ?? 0); i < order.length && heroes.length < heroCount; i += step) heroes.push(order[i]);
 const leadCount = Number(args.leads ?? heroes.length);
 heroes.forEach((id, i) => world.setIntelligence(id, 'llm', modelRef, i < leadCount));
-const focus = world.bot(heroes[0])!;
-const STAGES: LifeStage[] = ['infant', 'child', 'teen', 'youth', 'adult', 'middle', 'senior'];
+const focusId = heroes[0];
 const log = (s: string) => { if (!quiet) process.stdout.write(s + '\n'); };
 
-const favorite = (n: DecisionNode) => n.options.reduce((a, b) => ((b.weight ?? 1) > (a.weight ?? 1) ? b : a)).id;
-
-let decisions = 0;
-let differ = 0;
-let failures = 0;
-let blockedMs = 0;
-let peakInflight = 0;
-let autoCount = 0;
+// 模拟画面：按速度前进，但不越过 frontier
+let display = 0;
+let last = Date.now();
 let visibleStallMs = 0;
-let maxVisibleStallMs = 0;
-const inflight = new Map<string, Promise<void>>();
-const aborts = new Map<string, AbortController>();
-const background: Promise<unknown>[] = [];
-
-function dispatch() {
-  for (const node of world.pending) {
-    if (inflight.has(node.id)) continue;
-    const ctl = new AbortController();
-    aborts.set(node.id, ctl);
-    const p = brain.decide(world, node, ctl.signal)
-      .then((r) => {
-        world.resolveDecision(node.id, r.choice, 'llm', r.monologue, r.model);
-        const bot = world.bot(node.botId);
-        if (bot && r.goal) bot.goal = r.goal;
-      })
-      .catch((err) => {
-        if (ctl.signal.aborted) return;
-        failures++;
-        world.resolveDecision(node.id, favorite(node), 'auto');
-        log(`  决策失败，按性格：${String(err).slice(0, 120)}`);
-      })
-      .finally(() => { inflight.delete(node.id); aborts.delete(node.id); });
-    inflight.set(node.id, p);
-    peakInflight = Math.max(peakInflight, inflight.size);
+let maxStallMs = 0;
+let stallStart: number | undefined;
+let director!: Director;
+const advance = () => {
+  const now = Date.now();
+  if (speed) {
+    const want = display + speed * 12 * ((now - last) / 1000);
+    const f = director.frontier;
+    if (want > f && display >= f - 0.001 && !(director.world.finished && director.world.provisional.length === 0)) {
+      stallStart ??= now;
+    } else if (stallStart !== undefined) {
+      const s = now - stallStart;
+      visibleStallMs += s;
+      maxStallMs = Math.max(maxStallMs, s);
+      stallStart = undefined;
+    }
+    display = Math.min(f, want);
   }
-}
+  last = now;
+};
+
+director = new Director(world, brain, {
+  display: () => (speed ? Math.floor(display) : -Infinity),
+  ahead: () => ahead,
+  onError: (m) => log(`  ${m}`),
+});
 
 function report(node: DecisionNode) {
-  decisions++;
-  if (node.chosen !== favorite(node)) differ++;
-  if (node.botId !== focus.id) return;
-  const { year } = tickToYearMonth(node.tick, world.state.config.startYear);
-  const age = Math.floor((node.tick - focus.birthTick) / 12);
+  const bot = director.world.bot(focusId)!;
+  const { year } = tickToYearMonth(node.tick, director.world.state.config.startYear);
+  const age = Math.floor((node.tick - bot.birthTick) / 12);
+  if (node.kind === '__reflect') {
+    if (node.monologue) log(`  ── ${stageName(node.data?.stage as LifeStage)}反思：${node.monologue}`);
+    return;
+  }
   const opt = node.options.find((o) => o.id === node.chosen);
   log(`${year}（${age}岁）${node.situation}\n  → ${opt?.label}${node.chosen !== favorite(node) ? '  ※ 与规则首选不同' : ''}\n  「${node.monologue ?? ''}」`);
 }
 
 async function main() {
   log(`模型 ${modelRef} · 种子 ${seed} · 智能人格 ${heroes.length} 人（主角 ${Math.min(leadCount, heroes.length)}） · 并发 ${concurrency} · 档位 ${level}${speed ? ` · 画面 ${speed} 年/秒` : ''}`);
-  log(`跟随：${focus.name}（${focus.id}）`);
-  if (level >= 2) {
-    try { focus.portrait = await brain.portrait(world, focus); log(`旁白：${focus.portrait}`); } catch (e) { failures++; }
-  }
   const t0 = Date.now();
-  // 模拟画面：按速度前进，但不能超过模拟
-  let display = 0;
-  let last = Date.now();
-  const advance = () => {
-    const now = Date.now();
-    if (speed) display = Math.min(world.tick, display + speed * 12 * ((now - last) / 1000));
-    last = now;
-  };
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  while (!world.finished) {
+  let blockedMs = 0;
+  let guard = 0;
+  let spin = 0;
+  const done = () => director.world.finished && !director.unsettled && (!speed || display >= director.world.tick - 1);
+  if (args.progress) {
+    setInterval(() => {
+      const w = director.world;
+      process.stderr.write(`[${((Date.now() - t0) / 1000).toFixed(0)}s] 画面 ${display.toFixed(0)} frontier ${director.frontier} 模拟 ${w.tick} 推测 ${w.provisional.length} 待答 ${w.pending.length} 在路上 ${director.inflightCount} 队列 ${brain.queueDepth} 堆 ${(process.memoryUsage().heapUsed / 1e6).toFixed(0)}MB\n`);
+    }, 2000).unref();
+  }
+  while (!done() && guard++ < 5_000_000) {
     advance();
-    dispatch();
-    if (world.tick >= display + ahead) { await sleep(20); continue; }
-    const res = world.step();
-    for (const e of res.events) {
-      if (e.type === 'decision' && e.decisionId) {
-        const n = world.state.decisions[e.decisionId];
-        if (n.resolvedBy !== 'rules') report(n);
-      }
-      if (e.type === 'child' && inherit && e.relatedIds) {
-        const parent = world.bot(e.botId!);
-        const child = world.bot(e.relatedIds[1]);
-        // 继承来的是配角
-        if (parent?.intelligence === 'llm' && child && child.intelligence !== 'llm') world.setIntelligence(child.id, 'llm', modelRef, false);
-      }
-      // 阶段反思不挡世界
-      if (e.type === 'stage' && level >= 2) {
-        const bot = world.bot(e.botId!);
-        const idx = STAGES.indexOf(e.data?.stage as LifeStage);
-        if (!bot || bot.intelligence !== 'llm' || idx <= 1) continue;
-        const ended = STAGES[idx - 1];
-        background.push(brain.reflect(world, bot, ended).then((r) => {
-          bot.reflections.push({ stage: ended, tick: e.tick, text: r.reflection });
-          if (r.goal) bot.goal = r.goal;
-          if (bot.id === focus.id) log(`  ── ${stageName(ended)}反思：${r.reflection}`);
-        }).catch(() => { failures++; }));
-      }
+    director.maintain();
+    if (director.world.finished || director.world.tick >= director.target) {
+      spin = 0;
+      await director.whenAnswer(20);
+      continue;
     }
-    if (res.pending.length) dispatch();
-    if (res.blocked.length) {
+    const r = director.step();
+    // 一口气推进太多步时让出一下，让答案回调和计时器有机会运行
+    if (++spin > 200) { spin = 0; await new Promise((res) => setImmediate(res)); }
+    if (!r.advanced) {
+      spin = 0;
       const b0 = Date.now();
-      let stall = 0;
-      for (;;) {
-        advance();
-        const still = res.blocked.filter((n) => n.chosen === undefined);
-        if (!still.length) break;
-        const waits = still.map((n) => inflight.get(n.id)).filter(Boolean) as Promise<void>[];
-        // 配角：缓冲不到一半就凭直觉，把缓冲留给主角
-        if (speed && world.tick - display <= ahead / 2) {
-          for (const n of still) {
-            if (world.bot(n.botId)?.lead) continue;
-            world.resolveDecision(n.id, favorite(n), 'auto', '（来不及细想，凭直觉选了）');
-            aborts.get(n.id)?.abort();
-            autoCount++;
-          }
-        }
-        if (speed && display >= world.tick - 1) {
-          // 画面追上了：只剩主角在让世界等，用户能看到这段停顿
-          for (const n of still) {
-            if (world.bot(n.botId)?.lead || n.chosen !== undefined) continue;
-            world.resolveDecision(n.id, favorite(n), 'auto', '（来不及细想，凭直觉选了）');
-            aborts.get(n.id)?.abort();
-            autoCount++;
-          }
-          if (still.every((n) => n.chosen !== undefined)) break;
-          const s0 = Date.now();
-          await Promise.race([...waits, sleep(50)]);
-          stall += Date.now() - s0;
-        } else {
-          await Promise.race([...waits, sleep(20)]);
-        }
-      }
-      visibleStallMs += stall;
-      maxVisibleStallMs = Math.max(maxVisibleStallMs, stall);
+      await director.whenAnswer(20);
       blockedMs += Date.now() - b0;
     }
   }
-  await Promise.allSettled(background);
+  advance();
+  const w = director.world;
+  // 最终世界里跟随对象的一生（推测都已纠正）
+  log(`\n跟随：${w.bot(focusId)!.name}`);
+  for (const n of Object.values(w.state.decisions).filter((d) => d.botId === focusId && d.applied && d.resolvedBy !== 'rules').sort((a, b) => a.seq - b.seq)) report(n);
+
   const ms = Date.now() - t0;
   const lat = traces.filter((t) => t.kind === 'decide').map((t) => t.ms).sort((a, b) => a - b);
   const pct = (p: number) => (lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * p))] : 0);
-  const serialMs = lat.reduce((a, b) => a + b, 0);
+  const applied = Object.values(w.state.decisions).filter((d) => d.applied && d.resolvedBy !== 'rules' && d.kind !== '__reflect');
   const u = brain.usage;
-  const heroesAtEnd = world.state.botOrder.filter((id) => world.state.bots[id].intelligence === 'llm').length;
+  const focus = w.bot(focusId)!;
   const summary = {
     model: modelRef, seed, concurrency,
-    heroesAtStart: heroes.length, heroesAtEnd,
-    calls: u.calls, inputTokens: u.input, outputTokens: u.output, retries: u.errors, failures,
-    decisions, differFromRules: differ,
+    heroesAtStart: heroes.length,
+    heroesAtEnd: w.state.botOrder.filter((id) => w.state.bots[id].intelligence === 'llm').length,
+    calls: u.calls, inputTokens: u.input, outputTokens: u.output, retries: u.errors,
+    decisions: applied.length,
+    leadDecisions: applied.filter((d) => w.bot(d.botId)?.lead).length,
+    byModel: applied.filter((d) => d.resolvedBy === 'llm').length,
+    byIntuition: applied.filter((d) => d.resolvedBy === 'auto').length,
+    director: director.stats,
     decideLatencyMs: { p50: pct(0.5), p90: pct(0.9), max: lat[lat.length - 1] ?? 0 },
-    peakInflight,
     speedYearsPerSecond: speed || undefined,
     idealSeconds: speed ? +((endYear - era.defaultStartYear) / speed).toFixed(1) : undefined,
-    supportsFellBack: speed ? autoCount : undefined,
     visibleStallSeconds: speed ? +(visibleStallMs / 1000).toFixed(1) : undefined,
-    longestVisibleStallSeconds: speed ? +(maxVisibleStallMs / 1000).toFixed(1) : undefined,
+    longestVisibleStallSeconds: speed ? +(maxStallMs / 1000).toFixed(1) : undefined,
     wallSeconds: +(ms / 1000).toFixed(1),
     worldBlockedSeconds: +(blockedMs / 1000).toFixed(1),
-    serialWouldBlockSeconds: +(serialMs / 1000).toFixed(1),
-    focus: `${focus.name} · ${focus.deathTick !== undefined ? `卒于${world.state.config.startYear + Math.floor(focus.deathTick / 12)}，${focus.deathCause}` : '在世'}`,
+    focus: `${focus.name} · ${focus.deathTick !== undefined ? `卒于${w.state.config.startYear + Math.floor(focus.deathTick / 12)}，${focus.deathCause}` : '在世'}`,
   };
   process.stdout.write('\n' + JSON.stringify(summary, null, 2) + '\n');
 
@@ -220,7 +169,7 @@ async function main() {
   mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const file = join(dir, `${stamp}-${providerId}-${model.replace(/[^\w.-]/g, '_')}-s${seed}-h${heroes.length}.json`);
-  writeFileSync(file, JSON.stringify({ summary, persona: era.personaCard(focus, (world as unknown as { ctx: never }).ctx), reflections: focus.reflections, traces }, null, 2));
+  writeFileSync(file, JSON.stringify({ summary, persona: era.personaCard(focus, (w as unknown as { ctx: never }).ctx), reflections: focus.reflections, traces }, null, 2));
   process.stdout.write(`记录：${file}\n`);
 }
 

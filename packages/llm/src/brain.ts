@@ -1,4 +1,4 @@
-import type { World } from '@lifegame/core';
+import { REFLECT_KIND, type World } from '@lifegame/core';
 import {
   LlmDecisionOutput, LlmPortraitOutput, LlmReflectionOutput,
   type Bot, type DecisionNode, type LifeStage,
@@ -34,6 +34,21 @@ export function parseModelRef(s: string | undefined, fallback: ModelRef): ModelR
   return { providerId: s.slice(0, i), model: s.slice(i + 1) };
 }
 
+/** 模型对一个节点（决策或反思）的答案 */
+export interface NodeAnswer {
+  choice: string;
+  monologue?: string;
+  goal?: string;
+  model: string;
+}
+
+/** 在决策提出那一刻准备好的请求：提示词已定，指纹已算 */
+export interface Prepared {
+  key: string;
+  priority: number;
+  run(signal?: AbortSignal): Promise<NodeAnswer>;
+}
+
 export interface BrainOptions {
   providers: Record<string, Provider>;
   defaultModel: ModelRef;
@@ -49,6 +64,8 @@ export class Brain {
   readonly usage = emptyUsage();
   private cache: Map<string, CompleteResult>;
   private limiters = new Map<string, Limiter>();
+  /** 同一指纹的请求在路上时，后来者共享它 */
+  private sharing = new Map<string, Promise<CompleteResult>>();
 
   constructor(private opts: BrainOptions) {
     this.cache = opts.cache ?? new Map();
@@ -72,6 +89,39 @@ export class Brain {
     return l;
   }
 
+  /**
+   * 现在就生成提示词（世界会继续往前走），返回指纹和稍后执行的请求。
+   * 指纹相同 = 发给模型的内容完全相同，重放时可以放心复用答案。
+   */
+  prepare(world: World, node: DecisionNode): Prepared {
+    const bot = world.bot(node.botId)!;
+    const ref = parseModelRef(bot.model, this.opts.defaultModel);
+    const model = `${ref.providerId}/${ref.model}`;
+    if (node.kind === REFLECT_KIND) {
+      const messages = reflectionMessages(world, bot, node.data?.stage as LifeStage);
+      const priority = 1e6 + node.dueTick;
+      return {
+        key: `${model}:${hashString(JSON.stringify(messages))}`,
+        priority,
+        run: async (signal) => {
+          const out = await this.call('reflect', bot.id, ref, messages, LlmReflectionOutput, priority, signal);
+          return { choice: 'done', monologue: out.reflection, goal: out.goal, model };
+        },
+      };
+    }
+    const messages = decisionMessages(world, bot, node);
+    // 主角的请求永远排在配角前面，同级按到期先后
+    const priority = (bot.lead ? -1e6 : 0) + node.dueTick;
+    return {
+      key: `${model}:${hashString(JSON.stringify(messages))}`,
+      priority,
+      run: async (signal) => {
+        const out = await this.call('decide', bot.id, ref, messages, LlmDecisionOutput, priority, signal, (raw) => fixChoice(node, raw));
+        return { choice: out.choice, monologue: out.monologue, goal: out.goal, model };
+      },
+    };
+  }
+
   /** 提示词在调用时立刻生成（世界会继续往前走），请求按到期先后排队 */
   async decide(world: World, node: DecisionNode, signal?: AbortSignal): Promise<LlmDecisionOutput & { model: string }> {
     const bot = world.bot(node.botId)!;
@@ -79,13 +129,7 @@ export class Brain {
     const priority = (bot.lead ? -1e6 : 0) + node.dueTick;
     const ref = parseModelRef(bot.model, this.opts.defaultModel);
     const messages = decisionMessages(world, bot, node);
-    const out = await this.call('decide', bot.id, ref, messages, LlmDecisionOutput, priority, signal, (raw) => {
-      // 容错：模型可能回 label 而不是 id
-      const byId = node.options.find((o) => o.id === raw.choice);
-      if (byId) return raw;
-      const byLabel = node.options.find((o) => o.label === raw.choice || raw.choice.includes(o.label) || o.label.includes(raw.choice));
-      return { ...raw, choice: (byLabel ?? node.options[0]).id };
-    });
+    const out = await this.call('decide', bot.id, ref, messages, LlmDecisionOutput, priority, signal, (raw) => fixChoice(node, raw));
     return { ...out, model: `${ref.providerId}/${ref.model}` };
   }
 
@@ -116,7 +160,7 @@ export class Brain {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const msgs = attempt === 0 ? messages : [...messages, { role: 'user' as const, content: '上一次输出不是合法 JSON。请只输出一个 JSON 对象。' }];
-          res = await this.completeWithRetry(provider, ref, msgs, priority, signal);
+          res = attempt === 0 ? await this.shared(key, () => this.completeWithRetry(provider, ref, msgs, priority, signal)) : await this.completeWithRetry(provider, ref, msgs, priority, signal);
           const parsed = this.parse(res.text, schema);
           if (parsed.ok) {
             this.record(ref, res);
@@ -137,6 +181,17 @@ export class Brain {
     if (!parsed.ok) throw new Error(`缓存内容无法解析`);
     this.opts.onTrace?.({ kind, botId, messages, result: res.text, ms: Date.now() - t0 });
     return fix ? fix(parsed.value) : parsed.value;
+  }
+
+  /** 同一指纹已有请求在路上就共享它；那个请求被取消了，自己再发 */
+  private async shared(key: string, fn: () => Promise<CompleteResult>): Promise<CompleteResult> {
+    const existing = this.sharing.get(key);
+    if (existing) {
+      try { return await existing; } catch (e) { if (!isAbort(e)) throw e; }
+    }
+    const p = fn();
+    this.sharing.set(key, p);
+    try { return await p; } finally { if (this.sharing.get(key) === p) this.sharing.delete(key); }
   }
 
   /** 占一个并发名额发请求；限流或临时错误时让出名额、退避后重排 */
@@ -179,4 +234,11 @@ export class Brain {
     bm.output += res.usage.output;
     this.opts.onUsage?.(u, { model: k, usage: res.usage });
   }
+}
+
+/** 容错：模型可能回 label 而不是 id */
+function fixChoice(node: DecisionNode, raw: LlmDecisionOutput): LlmDecisionOutput {
+  if (node.options.find((o) => o.id === raw.choice)) return raw;
+  const byLabel = node.options.find((o) => o.label === raw.choice || raw.choice.includes(o.label) || o.label.includes(raw.choice));
+  return { ...raw, choice: (byLabel ?? node.options[0]).id };
 }

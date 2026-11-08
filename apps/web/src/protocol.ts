@@ -39,7 +39,7 @@ export interface BranchInfo {
 
 export type WorkerToMain =
   | { type: 'ready'; branch: BranchInfo; config: WorldConfig; era: { id: string; name: string; description: string; theme: { accent: string; paper: string; ink: string; fontFamily: string } }; bots: BotSummary[] }
-  | { type: 'tick'; branchId: string; summary: WorldSummary; events: WorldEvent[]; bots?: BotSummary[]; finished: boolean }
+  | { type: 'tick'; branchId: string; summary: WorldSummary; frontier: number; events: WorldEvent[]; bots?: BotSummary[]; finished: boolean }
   | { type: 'pending'; branchId: string; node: DecisionNode; needsUser: boolean }
   | { type: 'decided'; branchId: string; node: DecisionNode }
   | { type: 'thinking'; branchId: string; botId: string; kind: string; on: boolean }

@@ -543,6 +543,14 @@ function marriageMarket(bot: Bot, age: number, ctx: EraContext): void {
     return gap >= -4 && gap <= 10;
   });
   if (!cands.length) return;
+  // 每一对"我和你"有自己固定的随机数：决定抽不抽到你、看对眼的程度。
+  // 这样某个人变了，只影响恰好抽到他的人，而不会把整个同龄人的婚配全部打乱
+  const mr = ctx.keyedRng(`marry:${bot.id}:${t}`);
+  const pair = new Map<string, { order: number; noise: number }>();
+  for (const c of cands) {
+    const r = ctx.keyedRng(`marry:${bot.id}:${c.id}:${t}`);
+    pair.set(c.id, { order: r.next(), noise: r.gauss(0, 8) });
+  }
   const score = (c: Bot) => {
     let sc = 60;
     sc -= Math.abs(c.origin.ses - bot.origin.ses) * 8;
@@ -550,12 +558,13 @@ function marriageMarket(bot: Bot, age: number, ctx: EraContext): void {
     if (c.state.city !== bot.state.city) sc -= c.state.location === bot.state.location ? 10 : 22;
     sc += (c.personality.agreeableness + bot.personality.agreeableness - 100) * 0.15;
     sc += (c.talents.charm - 50) * 0.2;
-    sc += rng.gauss(0, 8);
+    sc += pair.get(c.id)!.noise;
     return sc;
   };
   let best: Bot | undefined;
   let bestScore = -Infinity;
-  for (const c of rng.shuffle(cands).slice(0, 12)) {
+  const sample = [...cands].sort((a, b) => pair.get(a.id)!.order - pair.get(b.id)!.order).slice(0, 12);
+  for (const c of sample) {
     const sc = score(c);
     if (sc > bestScore) { bestScore = sc; best = c; }
   }
@@ -565,7 +574,7 @@ function marriageMarket(bot: Bot, age: number, ctx: EraContext): void {
   const other = me === bot ? best : bot;
   const meAge = ctx.age(me);
   const mePeak = me.sex === 'male' ? 28 : 26;
-  const intro = other.state.city === me.state.city ? (rng.chance(0.5) ? '经人介绍' : '在朋友聚会上') : '经老家亲戚介绍';
+  const intro = other.state.city === me.state.city ? (mr.chance(0.5) ? '经人介绍' : '在朋友聚会上') : '经老家亲戚介绍';
   const pDesc = `${other.name}，${ctx.age(other)}岁，${other.state.job?.title ?? '暂无工作'}，${EDU_LABEL[other.state.education]}，${['赤贫', '贫寒', '普通', '小康', '富裕'][other.origin.ses - 1]}家庭${other.state.city === me.state.city ? '' : `，人在${other.state.city}`}。`;
   const pressure = meAge > mePeak + 2 ? 1.6 : 1;
   const options: DecisionOption[] = [

@@ -5,3 +5,9 @@ dist/
 .env
 .env.local
 runs/
+
+# 源码目录里不应有编译产物
+packages/*/src/**/*.js
+packages/*/src/**/*.js.map
+packages/*/src/**/*.d.ts
+packages/*/src/**/*.d.ts.map

@@ -25,6 +25,8 @@ export interface BranchData {
   displayTick: number;
   /** 回退一次加一，视图据此重建缓存 */
   epoch: number;
+  /** 画面最多能播到的 tick：不越过任何还没被真答案确认的推测 */
+  frontier: number;
 }
 
 /** 只保留出现在事件里的决策卡片 */
@@ -34,14 +36,14 @@ function decidedIn(events: WorldEvent[], from: Record<string, DecisionNode>): Re
   return out;
 }
 
-/** 画面上的"现在"：不超过模拟实际跑到的位置 */
+/** 画面上的"现在"：不超过 frontier */
 export function nowOf(br?: BranchData): number {
-  return br ? Math.min(br.displayTick, br.summary?.tick ?? 0) : 0;
+  return br ? Math.min(br.displayTick, br.frontier) : 0;
 }
 
-/** 画面是否追上了模拟，正在等某个人想清楚 */
+/** 画面是否追上了 frontier，正在等某个人想清楚 */
 export function caughtUp(br?: BranchData): boolean {
-  return !!br && br.displayTick >= (br.summary?.tick ?? 0) - 1 && !br.finished;
+  return !!br && br.displayTick >= br.frontier - 1 && !br.finished;
 }
 
 function frameOf(bots: BotSummary[], tick: number): Record<string, number> {
@@ -263,7 +265,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       for (const b of m.bots) bots[b.id] = b;
       set({
         config: m.config, era: m.era,
-        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: { 0: frameOf(m.bots, 0) }, displayTick: 0, epoch: 0 } },
+        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: { 0: frameOf(m.bots, 0) }, displayTick: 0, epoch: 0, frontier: 0 } },
         activeBranch: m.branch.id,
       });
       const hero = m.bots.find((b) => b.intelligence === 'llm') ?? m.bots[0];
@@ -274,7 +276,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       set((s) => {
         const br = s.branches[m.branchId];
         if (!br) return {};
-        const next: BranchData = { ...br, summary: m.summary, finished: m.finished };
+        const next: BranchData = { ...br, summary: m.summary, finished: m.finished, frontier: m.frontier };
         if (m.events.length) next.events = br.events.concat(m.events);
         if (m.bots) {
           const bots: Record<string, BotSummary> = {};
@@ -337,7 +339,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         const frames: Record<number, Record<string, number>> = {};
         if (parent) for (const [k, f] of Object.entries(parent.frames)) if (Number(k) <= snapTick) frames[Number(k)] = f;
         return {
-          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: parent?.displayTick ?? 0, epoch: 0 } },
+          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: parent?.displayTick ?? 0, epoch: 0, frontier: 0 } },
           activeBranch: m.branch.id,
           compareBranch: m.branch.parentId,
           viewTick: undefined,
@@ -379,7 +381,7 @@ function startClock(set: Set, get: Get): void {
     const s = get();
     const br = s.branches[s.activeBranch];
     if (br) {
-      const sim = br.summary?.tick ?? 0;
+      const sim = br.frontier;
       let cur = displayFloat.get(br.info.id) ?? br.displayTick;
       if (s.playing) {
         cur = Number.isFinite(s.speed) ? Math.min(sim, cur + s.speed * dt) : sim;

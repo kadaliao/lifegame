@@ -32,7 +32,12 @@ export interface EraContext {
   openDecision(botId: string, kind?: string): boolean;
   /** 新生儿进入世界 */
   addBot(bot: Bot): Bot;
+  /** 初始人口的编号 */
   nextId(prefix: string): string;
+  /** 孩子的稳定编号：母亲编号.第几个孩子 */
+  childId(mother: Bot): string;
+  /** 由键派生的一次性随机数，不消耗任何人的随机数流（用于结果取决于别人状态的抽签） */
+  keyedRng(key: string): Rng;
   kill(bot: Bot, cause: string): void;
 }
 

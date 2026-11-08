@@ -1,7 +1,7 @@
 import {
   TICKS_PER_YEAR, ageAt, tickToYearMonth,
   type Bot, type DecisionNode, type DecisionResolver, type IntelligenceMode,
-  type WorldConfig, type WorldEvent, type WorldStateShape, type WorldSummary, type LifeStage,
+  type WorldConfig, type WorldEvent, type WorldFlags, type WorldStateShape, type WorldSummary, type LifeStage,
 } from '@lifegame/schema';
 import { Rng } from './rng.js';
 import type { DecisionRequest, EraContext, EraPack, LogInput } from './era.js';
@@ -14,7 +14,22 @@ export interface ScriptedChoice {
   kind?: string;
   monologue?: string;
   model?: string;
+  goal?: string;
+  provisional?: boolean;
+  key?: string;
 }
+
+export interface AnswerExtra {
+  goal?: string;
+  /** 推测答案：先按它往下走，真答案回来可能被纠正 */
+  provisional?: boolean;
+  /** 提示词指纹 */
+  key?: string;
+}
+
+/** 引擎内建的决策类型：阶段反思。答案（monologue）是反思文字 */
+export const REFLECT_KIND = '__reflect';
+const STAGE_SEQ: LifeStage[] = ['infant', 'child', 'teen', 'youth', 'adult', 'middle', 'senior'];
 export type ScriptedChoices = Record<string, ScriptedChoice>;
 
 export interface StepResult {
@@ -46,6 +61,10 @@ export class World {
   /** 回放时按 id 预置的选择 */
   scripted: ScriptedChoices = {};
   private ctx: EraContext;
+  /** 每个人的随机数流（懒加载，存回 bot.rngState） */
+  private rngs = new Map<string, Rng>();
+  /** 当前上下文用的随机数流 */
+  private curRng: Rng;
   private stepEvents: WorldEvent[] = [];
   private stepPending: DecisionNode[] = [];
 
@@ -53,6 +72,7 @@ export class World {
     this.era = era;
     this.state = state;
     this.rng = new Rng(state.rngState);
+    this.curRng = this.rng;
     this.ctx = this.makeContext();
   }
 
@@ -70,6 +90,8 @@ export class World {
       decisions: {},
       pendingDecisionIds: [],
       openDecisionIds: [],
+      provisionalIds: [],
+      flags: { reflections: false, inherit: false },
       eraState: era.initEraState(),
       nextId: 1,
     };
@@ -82,29 +104,58 @@ export class World {
   static restore(era: EraPack, snapshot: YearSnapshot, log: WorldEvent[], scripted: ScriptedChoices = {}): World {
     const state = JSON.parse(snapshot.json) as WorldStateShape;
     state.log = log.slice(0, snapshot.logLength);
-    state.openDecisionIds ??= [];
+    normalize(state);
     const world = new World(era, state);
     world.scripted = scripted;
     world.snapshots.set(snapshot.tick, snapshot);
-    // 快照时还没有答案的决策，若有脚本就填上
-    for (const id of [...state.pendingDecisionIds]) {
+    // 快照里的决策若有脚本，以脚本为准（还没落地的才有意义）
+    for (const id of [...state.openDecisionIds]) {
       const s = scripted[id];
       const n = state.decisions[id];
-      if (s && n && (s.botId ?? n.botId) === n.botId && (s.kind ?? n.kind) === n.kind) {
-        world.resolveDecision(id, s.choice, s.by, s.monologue, s.model);
-      }
+      if (!s || !n || (s.kind ?? n.kind) !== n.kind) continue;
+      if (n.chosen === undefined) world.applyScript(n, s);
+      else world.overrideAnswer(id, s.choice, s.by, s.monologue, s.model, { goal: s.goal, provisional: s.provisional, key: s.key });
     }
     return world;
   }
 
   static fromJSON(era: EraPack, json: string): World {
     const state = JSON.parse(json) as WorldStateShape;
+    normalize(state);
     return new World(era, state);
   }
 
   toJSON(): string {
-    this.state.rngState = this.rng.getState();
+    this.syncRngs();
     return JSON.stringify(this.state);
+  }
+
+  setFlags(flags: Partial<WorldFlags>): void {
+    this.state.flags = { ...this.state.flags, ...flags };
+  }
+
+  /** 这个人自己的随机数流 */
+  rngOf(bot: Bot): Rng {
+    let r = this.rngs.get(bot.id);
+    if (!r) {
+      r = new Rng(bot.rngState ?? this.seedFor(`bot:${bot.id}`));
+      this.rngs.set(bot.id, r);
+    }
+    return r;
+  }
+
+  private seedFor(key: string): number {
+    let h = 2166136261 ^ this.state.config.seed;
+    for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619);
+    return h >>> 0;
+  }
+
+  private syncRngs(): void {
+    this.state.rngState = this.rng.getState();
+    for (const [id, r] of this.rngs) {
+      const b = this.state.bots[id];
+      if (b) b.rngState = r.getState();
+    }
   }
 
   private populate(): void {
@@ -128,6 +179,11 @@ export class World {
 
   get pending(): DecisionNode[] {
     return this.state.pendingDecisionIds.map((id) => this.state.decisions[id]);
+  }
+
+  /** 已经按推测落地、还没被真答案确认的决策 */
+  get provisional(): DecisionNode[] {
+    return this.state.provisionalIds.map((id) => this.state.decisions[id]);
   }
 
   get finished(): boolean {
@@ -181,6 +237,7 @@ export class World {
     this.ctx.year = year;
     this.ctx.month = month;
 
+    this.curRng = this.rng;
     if (month === 1) this.era.onYear(this.ctx);
     this.applyDue(t);
 
@@ -196,19 +253,24 @@ export class World {
     for (const id of order) {
       const bot = this.state.bots[id];
       if (bot.deathTick !== undefined || bot.birthTick > t) continue;
+      // 处理谁就用谁的随机数流
+      this.curRng = this.rngOf(bot);
       const lived = t - bot.birthTick;
       if (lived > 0 && lived % TICKS_PER_YEAR === 0) {
         const age = lived / TICKS_PER_YEAR;
         const stage = this.era.stageOf(age);
         if (stage !== bot.stage) {
+          const ended = bot.stage;
           bot.stage = stage;
           this.log({ type: 'stage', botId: bot.id, importance: 4, text: `${bot.name}${age}岁，进入${stageName(stage)}。`, data: { stage, age } });
+          if (STAGE_SEQ.indexOf(ended) >= 1) this.requestReflection(bot, ended);
         }
         this.era.onBirthday(bot, age, this.ctx);
       }
       if (bot.deathTick !== undefined) continue;
       this.era.onTick(bot, this.ctx);
     }
+    this.curRng = this.rng;
 
     this.state.tick++;
     if (this.state.tick % TICKS_PER_YEAR === 0) this.takeSnapshot();
@@ -229,11 +291,12 @@ export class World {
 
   /** 按提出顺序落地到期的决策；落地时可能连锁提出新的决策 */
   private applyDue(t: number): void {
-    for (;;) {
+    for (let guard = 0; ; guard++) {
+      if (guard > 1000) throw new Error(`同一 tick 内落地的决策超过 1000 个，时代包可能有连锁死循环 @${t}`);
       const due = this.state.openDecisionIds
         .map((id) => this.state.decisions[id])
         .filter((n) => n.dueTick <= t && n.chosen !== undefined)
-        .sort((a, b) => seqOf(a.id) - seqOf(b.id));
+        .sort((a, b) => a.seq - b.seq);
       if (!due.length) return;
       for (const n of due) this.applyDecision(n);
     }
@@ -254,30 +317,74 @@ export class World {
   // ---------- 决策 ----------
 
   /** 给决策一个答案。它在犹豫期结束（dueTick）时才落地 */
-  resolveDecision(id: string, choice: string, by: DecisionResolver, monologue?: string, model?: string): void {
+  resolveDecision(id: string, choice: string, by: DecisionResolver, monologue?: string, model?: string, extra: AnswerExtra = {}): void {
     const node = this.state.decisions[id];
     if (!node) throw new Error(`未知决策 ${id}`);
     if (node.chosen !== undefined) return;
+    this.setAnswer(node, choice, by, monologue, model, extra);
+    this.state.pendingDecisionIds = this.state.pendingDecisionIds.filter((p) => p !== id);
+  }
+
+  /** 换掉一个还没落地的答案（推测答案到期前真答案回来了） */
+  overrideAnswer(id: string, choice: string, by: DecisionResolver, monologue?: string, model?: string, extra: AnswerExtra = {}): void {
+    const node = this.state.decisions[id];
+    if (!node || node.applied) return;
+    this.setAnswer(node, choice, by, monologue, model, extra);
+    this.state.pendingDecisionIds = this.state.pendingDecisionIds.filter((p) => p !== id);
+  }
+
+  /** 推测答案就此算数（等太久了） */
+  finalize(id: string): void {
+    const node = this.state.decisions[id];
+    if (!node) return;
+    node.provisional = false;
+    this.state.provisionalIds = this.state.provisionalIds.filter((p) => p !== id);
+  }
+
+  private setAnswer(node: DecisionNode, choice: string, by: DecisionResolver, monologue: string | undefined, model: string | undefined, extra: AnswerExtra): void {
     const opt = node.options.find((o) => o.id === choice) ?? node.options[0];
     node.chosen = opt.id;
     node.resolvedBy = by;
     node.monologue = monologue;
     node.model = model;
-    this.state.pendingDecisionIds = this.state.pendingDecisionIds.filter((p) => p !== id);
+    node.goal = extra.goal;
+    node.provisional = extra.provisional || undefined;
+    if (extra.key !== undefined) node.promptKey = extra.key;
+  }
+
+  private applyScript(node: DecisionNode, sc: ScriptedChoice): void {
+    this.resolveDecision(node.id, sc.choice, sc.by, sc.monologue, sc.model, { goal: sc.goal, provisional: sc.provisional, key: sc.key });
   }
 
   private applyDecision(node: DecisionNode): void {
     node.applied = true;
     this.state.openDecisionIds = this.state.openDecisionIds.filter((p) => p !== node.id);
+    if (node.provisional) this.state.provisionalIds.push(node.id);
     const bot = this.state.bots[node.botId];
     if (!bot || bot.deathTick !== undefined) return;
-    const opt = node.options.find((o) => o.id === node.chosen) ?? node.options[0];
-    this.log({
-      type: 'decision', botId: bot.id, importance: 7, decisionId: node.id,
-      text: `${node.situation}${bot.name}选择了「${opt.label}」。`,
-      data: { kind: node.kind, choice: opt.id, by: node.resolvedBy },
-    });
-    this.era.decisions[node.kind]?.apply(bot, opt.id, this.ctx, node);
+    const prev = this.curRng;
+    this.curRng = this.rngOf(bot);
+    try {
+      if (node.kind === REFLECT_KIND) {
+        const stage = node.data?.stage as LifeStage;
+        if (node.monologue) {
+          bot.reflections.push({ stage, tick: this.ctx.tick, text: node.monologue });
+          this.log({ type: 'reflection', botId: bot.id, importance: 5, decisionId: node.id, text: `${bot.name}回顾${stageName(stage)}：${node.monologue}`, data: { stage } });
+        }
+        if (node.goal) bot.goal = node.goal;
+        return;
+      }
+      const opt = node.options.find((o) => o.id === node.chosen) ?? node.options[0];
+      this.log({
+        type: 'decision', botId: bot.id, importance: 7, decisionId: node.id,
+        text: `${node.situation}${bot.name}选择了「${opt.label}」。`,
+        data: { kind: node.kind, choice: opt.id, by: node.resolvedBy },
+      });
+      if (node.goal) bot.goal = node.goal;
+      this.era.decisions[node.kind]?.apply(bot, opt.id, this.ctx, node);
+    } finally {
+      this.curRng = prev;
+    }
   }
 
   setIntelligence(botId: string, mode: IntelligenceMode, model?: string, lead = mode === 'llm'): void {
@@ -305,7 +412,7 @@ export class World {
       if (d.chosen === undefined || d.resolvedBy === 'rules') continue;
       if (d.tick > node.tick || d.id === decisionId) continue;
       // 目标 bot 在改选之后的连锁决策属于旧分支的后果，不照搬
-      if (d.botId === node.botId && seqOf(d.id) > seqOf(decisionId)) continue;
+      if (d.botId === node.botId && botSeq(d.id) > botSeq(decisionId)) continue;
       scripted[d.id] = scriptOf(d);
     }
     scripted[decisionId] = { choice: altChoice, by: 'user', monologue: '（分叉：换一条路试试）', botId: node.botId, kind: node.kind };
@@ -314,6 +421,7 @@ export class World {
     child.state.branchId = branchId;
     child.state.parentBranchId = this.state.branchId;
     child.state.forkedAtTick = node.tick;
+    child.state.flags = { ...this.state.flags };
     child.copyIntelligenceFrom(this);
     // 重放到改选被提出的那个月，之后的世界开始分歧
     while (child.state.tick <= node.tick && !child.finished) {
@@ -324,26 +432,25 @@ export class World {
   }
 
   /**
-   * 回退到 toTick 所在年的年初重放，用于在画面之后改变某人的设定（赋予智能、由用户掌控）。
-   * toTick 之前发生的决策原样照搬；之后的模型/用户答案尽量复用，exceptBot 之后的决策重新做。
+   * 回退到 toTick 所在年的年初重放。toTick 之前提出的决策原样照搬（含规则决策与推测答案），
+   * 之后的由驱动层重新答复（能复用的答案由驱动层按提示词指纹复用）。
+   * 用于：推测被真答案纠正；在画面之后改变某人的设定。
    */
-  rewind(toTick: number, exceptBot?: string): World {
+  rewind(toTick: number): World {
     let snapTick = Math.floor(toTick / TICKS_PER_YEAR) * TICKS_PER_YEAR;
     while (snapTick > 0 && !this.snapshots.has(snapTick)) snapTick -= TICKS_PER_YEAR;
     const snap = this.snapshots.get(snapTick);
     if (!snap) throw new Error(`缺少 tick ${snapTick} 的快照`);
     const scripted: ScriptedChoices = {};
     for (const d of Object.values(this.state.decisions)) {
-      if (d.chosen === undefined) continue;
-      const history = d.tick < toTick;
-      if (!history && (d.resolvedBy === 'rules' || d.botId === exceptBot)) continue;
-      scripted[d.id] = scriptOf(d);
+      if (d.chosen !== undefined && d.tick < toTick) scripted[d.id] = scriptOf(d);
     }
     const w = World.restore(this.era, snap, this.state.log, scripted);
     for (const [t, sn] of this.snapshots) if (t < snapTick) w.snapshots.set(t, sn);
     w.state.branchId = this.state.branchId;
     w.state.parentBranchId = this.state.parentBranchId;
     w.state.forkedAtTick = this.state.forkedAtTick;
+    w.state.flags = { ...this.state.flags };
     w.copyIntelligenceFrom(this);
     return w;
   }
@@ -365,7 +472,7 @@ export class World {
   // ---------- 内部 ----------
 
   private takeSnapshot(): void {
-    this.state.rngState = this.rng.getState();
+    this.syncRngs();
     const { log, ...rest } = this.state;
     const json = JSON.stringify({ ...rest, log: [] });
     this.snapshots.set(this.state.tick, { tick: this.state.tick, logLength: log.length, json });
@@ -383,19 +490,21 @@ export class World {
   }
 
   private requestDecision(bot: Bot, req: DecisionRequest): DecisionNode {
-    const id = this.nextId('d');
+    const n = (bot.decisionCount ?? 0) + 1;
+    bot.decisionCount = n;
+    const id = `${bot.id}:${n}`;
     const t = this.state.tick;
     const delay = Math.max(0, req.deliberation ?? this.era.decisions[req.kind]?.deliberation ?? 1);
     const node: DecisionNode = {
-      id, kind: req.kind, tick: t, dueTick: t + delay, botId: bot.id,
+      id, seq: this.state.nextId++, kind: req.kind, tick: t, dueTick: t + delay, botId: bot.id,
       situation: req.situation, options: req.options, data: req.data,
     };
     this.state.decisions[id] = node;
     const sc = this.scripted[id];
-    const valid = sc && (sc.botId ?? bot.id) === bot.id && (sc.kind ?? req.kind) === req.kind ? sc : undefined;
+    const valid = sc && (sc.kind ?? req.kind) === req.kind ? sc : undefined;
     if ((valid && valid.by === 'rules') || (!valid && bot.intelligence === 'rules')) {
-      // 规则决策当场落地；照搬时也要消耗同样的随机数，否则后面的世界会走样
-      const opt = this.rng.weighted(req.options, (o) => o.weight ?? 1);
+      // 规则决策当场落地；照搬时也要消耗同样的随机数，否则这个人后面的人生会走样
+      const opt = this.rngOf(bot).weighted(req.options, (o) => o.weight ?? 1);
       node.dueTick = t;
       this.state.openDecisionIds.push(id);
       this.resolveDecision(id, valid ? valid.choice : opt.id, 'rules');
@@ -404,9 +513,21 @@ export class World {
     }
     this.state.openDecisionIds.push(id);
     this.state.pendingDecisionIds.push(id);
-    if (valid) this.resolveDecision(id, valid.choice, valid.by, valid.monologue, valid.model);
+    if (valid) this.applyScript(node, valid);
     else this.stepPending.push(node);
     return node;
+  }
+
+  /** 智能人格的人生阶段结束：请模型写一段反思，半年内生效 */
+  private requestReflection(bot: Bot, ended: LifeStage): void {
+    if (!this.state.flags.reflections || bot.intelligence !== 'llm') return;
+    this.requestDecision(bot, {
+      kind: REFLECT_KIND,
+      situation: `${stageName(ended)}结束了。`,
+      options: [{ id: 'done', label: '回顾', description: '' }],
+      data: { stage: ended },
+      deliberation: 6,
+    });
   }
 
   private nextId(prefix: string): string {
@@ -418,7 +539,9 @@ export class World {
     const ym = tickToYearMonth(this.state.tick, this.state.config.startYear);
     return {
       get world() { return self.state; },
-      get rng() { return self.rng; },
+      get rng() { return self.curRng; },
+      keyedRng: (key) => new Rng(self.seedFor(`key:${key}`)),
+      childId: (mother) => `${mother.id}.${mother.childrenIds.length + 1}`,
       tick: this.state.tick,
       year: ym.year,
       month: ym.month,
@@ -432,6 +555,11 @@ export class World {
         return n.botId === botId && (!kind || n.kind === kind);
       }),
       addBot: (bot) => {
+        // 智能人格的子女继承智能，作为配角
+        if (self.state.flags.inherit) {
+          const parent = bot.parentIds.map((p) => self.state.bots[p]).find((p) => p?.intelligence === 'llm');
+          if (parent) { bot.intelligence = 'llm'; bot.model = parent.model; bot.lead = false; }
+        }
         self.state.bots[bot.id] = bot;
         self.state.botOrder.push(bot.id);
         return bot;
@@ -441,6 +569,11 @@ export class World {
         if (bot.deathTick !== undefined) return;
         bot.deathTick = self.ctx.tick;
         bot.deathCause = cause;
+        // 还没答复的决定随人而去，免得世界为他等答案
+        for (const id of [...self.state.pendingDecisionIds]) {
+          const n = self.state.decisions[id];
+          if (n.botId === bot.id) self.resolveDecision(id, n.options[0].id, 'auto');
+        }
         const age = ageAt(bot.birthTick, self.ctx.tick);
         self.log({ type: 'death', botId: bot.id, importance: 10, text: `${bot.name}${cause}，终年${age}岁。`, data: { cause, age } });
         if (bot.spouseId) {
@@ -457,11 +590,21 @@ export class World {
 }
 
 function scriptOf(d: DecisionNode): ScriptedChoice {
-  return { choice: d.chosen!, by: d.resolvedBy!, monologue: d.monologue, model: d.model, botId: d.botId, kind: d.kind };
+  return {
+    choice: d.chosen!, by: d.resolvedBy!, monologue: d.monologue, model: d.model, botId: d.botId, kind: d.kind,
+    goal: d.goal, provisional: d.provisional, key: d.promptKey,
+  };
 }
 
-function seqOf(id: string): number {
-  return Number(id.replace(/^\D+/, ''));
+/** 决策编号里"第几个决定"的部分 */
+function botSeq(id: string): number {
+  return Number(id.slice(id.lastIndexOf(':') + 1));
+}
+
+function normalize(state: WorldStateShape): void {
+  state.openDecisionIds ??= [];
+  state.provisionalIds ??= [];
+  state.flags ??= { reflections: false, inherit: false };
 }
 
 export function stageName(stage: LifeStage): string {
