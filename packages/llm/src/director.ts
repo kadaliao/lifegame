@@ -13,6 +13,7 @@
 import { REFLECT_KIND, type World } from '@lifegame/core';
 import type { DecisionNode, WorldEvent } from '@lifegame/schema';
 import type { Brain, NodeAnswer, Prepared } from './brain.js';
+import { LlmHttpError } from './provider.js';
 import { isAbort } from './scheduler.js';
 
 export interface DirectorHooks {
@@ -249,9 +250,15 @@ export class Director {
         if (ctl.signal.aborted || isAbort(err)) return;
         const cur = this.world.state.decisions[node.id];
         const name = this.world.bot(node.botId)?.name ?? '';
-        this.hooks.onError?.(`${name}的模型请求失败，按性格先选了：${String(err).slice(0, 120)}`);
+        // 额度用完由 Brain 统一报一次，这里不再逐条提示
+        if (!(err instanceof LlmHttpError && err.quota)) this.hooks.onError?.(`${name}的模型请求失败，按性格先选了：${String(err).slice(0, 120)}`);
         if (cur && cur.promptKey === key && cur.chosen === undefined) {
           this.world.resolveDecision(node.id, favorite(cur), 'auto', undefined, undefined, { key });
+        } else if (cur && cur.promptKey === key && cur.provisional) {
+          // 已经按最可能的选择推测着走了：就此定下，别让画面停在这里干等到超时
+          this.world.finalize(node.id);
+          this.stuckSince.delete(node.id);
+          this.stats.fallbacks++;
         }
       })
       .finally(() => {

@@ -82,4 +82,6 @@ export type WorkerToMain =
   | { type: 'reborn'; branchId: string; botId: string; birthTick: number }
   | { type: 'rewind'; branchId: string; fromSeq: number; fromTick: number }
   | { type: 'usage'; usage: UsageRecord; queue: number }
+  /** 这个服务的额度用完了，之后的节点按性格决定 */
+  | { type: 'exhausted'; providerId: string; label: string }
   | { type: 'error'; message: string };

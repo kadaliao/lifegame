@@ -2,6 +2,7 @@
   "name": "lifegame",
   "private": true,
   "version": "0.1.0",
+  "type": "module",
   "description": "有真正智能的人生模拟世界",
   "scripts": {
     "build": "pnpm -r --filter './packages/*' run build",

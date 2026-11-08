@@ -41,7 +41,7 @@ export function RebornPanel() {
   const [talents, setTalents] = useState<Num<Talents>>({});
   const [values, setValues] = useState<Num<Values>>({});
   const [bio, setBio] = useState('');
-  const [mode, setMode] = useState<Mode>('lead');
+  const [mode, setMode] = useState<Mode>(() => (useStore.getState().brain.defaultModel ? 'lead' : 'rules'));
   const [model, setModel] = useState('');
   const [more, setMore] = useState(false);
 
@@ -49,6 +49,8 @@ export function RebornPanel() {
   const by = year ?? nowYear;
   const models = brain.providers.flatMap((p) => p.models.map((m) => `${p.id}/${m}`));
   const usedModel = model || brain.defaultModel;
+  /** 没有可用的模型：只能按规则活或亲自掌控 */
+  const noModel = !brain.defaultModel;
   const places = opts.places.filter((p) => p.region === region);
   const past = by < nowYear;
 
@@ -63,9 +65,9 @@ export function RebornPanel() {
       name: name.trim() || undefined, sex, region, hometown: hometown || undefined, ses,
       fatherJob: fatherJob || undefined, motherJob: motherJob || undefined,
       personality, talents, values, bio: bio.trim() || undefined,
-      intelligence: mode === 'rules' ? 'rules' : 'llm',
-      model: mode === 'rules' ? undefined : usedModel,
-      lead: mode !== 'rules',
+      intelligence: mode === 'rules' || (noModel && mode === 'lead') ? 'rules' : 'llm',
+      model: mode === 'rules' || noModel ? undefined : usedModel,
+      lead: mode !== 'rules' && !(noModel && mode === 'lead'),
     };
     reborn(spec, by, mode === 'user');
   };
@@ -151,11 +153,11 @@ export function RebornPanel() {
 
         <h3>谁来过这一生</h3>
         <div className="rb-modes">
-          <label className={mode === 'lead' ? 'on' : ''}><input type="radio" checked={mode === 'lead'} onChange={() => setMode('lead')} />让模型以 TA 的人格去活（主角）</label>
+          <label className={mode === 'lead' ? 'on' : ''}><input type="radio" checked={mode === 'lead'} onChange={() => setMode('lead')} disabled={noModel} />让模型以 TA 的人格去活（主角）{noModel && <span className="muted">：现在没有可用的模型，可以在设置里填一个密钥</span>}</label>
           <label className={mode === 'user' ? 'on' : ''}><input type="radio" checked={mode === 'user'} onChange={() => setMode('user')} />我亲自替 TA 做每个人生决定，也可以随时交给模型</label>
           <label className={mode === 'rules' ? 'on' : ''}><input type="radio" checked={mode === 'rules'} onChange={() => setMode('rules')} />按规则活，不调用模型</label>
         </div>
-        {mode !== 'rules' && (
+        {mode !== 'rules' && !noModel && (
           <label className="rb-model">模型
             <select value={usedModel} onChange={(e) => setModel(e.target.value)}>
               {models.map((m) => <option key={m} value={m}>{m}</option>)}

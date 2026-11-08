@@ -24,9 +24,14 @@ export interface CompleteResult {
 
 /** 带 HTTP 状态的错误，调度器据此决定是否重试 */
 export class LlmHttpError extends Error {
-  constructor(message: string, readonly status: number, readonly retryAfterMs?: number) {
+  constructor(message: string, readonly status: number, readonly retryAfterMs?: number, readonly quota = false) {
     super(message);
   }
+}
+
+/** 额度或余额用完：重试没用，要等到明天或者充值 */
+export function isQuotaError(status: number, body: string): boolean {
+  return status === 402 || (status === 429 && /insufficient_quota|quota_exceeded|quota exceeded|daily .*quota|余额|额度/i.test(body));
 }
 
 export interface Provider {
@@ -67,8 +72,10 @@ export interface ProviderConfig {
   apiKey?: string;
   /** 可选模型列表，供界面下拉 */
   models: string[];
-  /** 密钥来自开发服务器的环境变量，浏览器经本地代理访问 */
+  /** 站点提供的服务：密钥在服务器的环境变量里，浏览器经 /api/llm/site/<id> 访问 */
   env?: boolean;
+  /** 同时在路上的请求数上限，默认 4 */
+  concurrency?: number;
 }
 
 /** OpenAI 兼容接口：aihubmix、OpenRouter、Ollama(/v1)、vLLM 等都能用 */
@@ -105,7 +112,7 @@ export class OpenAICompatibleProvider implements Provider {
     }
     if (!res.ok) {
       const ra = Number(res.headers.get('retry-after'));
-      throw new LlmHttpError(`LLM ${res.status}: ${bodyText.slice(0, 300)}`, res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined);
+      throw new LlmHttpError(`LLM ${res.status}: ${bodyText.slice(0, 300)}`, res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined, isQuotaError(res.status, bodyText));
     }
     // 有的服务会在 JSON 字符串里放裸换行，标准解析会失败；把控制字符换成空格再试
     let parsed: unknown;
@@ -169,11 +176,3 @@ export function createProvider(cfg: ProviderConfig): Provider {
   if (cfg.kind === 'mock') return new MockProvider(cfg.id);
   return new OpenAICompatibleProvider(cfg);
 }
-
-export const DEFAULT_PROVIDERS: ProviderConfig[] = [
-  { id: 'mock', label: '假模型（免费测试）', kind: 'mock', models: ['mock'] },
-  { id: 'aihubmix', label: 'aihubmix', kind: 'openai-compatible', baseUrl: 'https://aihubmix.com/v1', models: ['gpt-4o-mini', 'gpt-4o', 'claude-sonnet-4-5', 'gemini-2.5-flash', 'deepseek-v3'] },
-  { id: 'ollama', label: 'Ollama 本地', kind: 'openai-compatible', baseUrl: 'http://localhost:11434/v1', apiKey: 'ollama', models: ['qwen3:8b', 'qwen2.5:7b', 'llama3.1:8b'] },
-  { id: 'openai', label: 'OpenAI', kind: 'openai-compatible', baseUrl: 'https://api.openai.com/v1', models: ['gpt-4o-mini', 'gpt-4o'] },
-  { id: 'deepseek', label: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', models: ['deepseek-chat'] },
-];

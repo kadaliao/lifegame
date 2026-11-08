@@ -4,6 +4,7 @@ export function DecisionPanel() {
   const pending = useStore((s) => s.pendingUser);
   const resolve = useStore((s) => s.resolveUser);
   const ask = useStore((s) => s.askBrain);
+  const hasModel = useStore((s) => !!s.brain.defaultModel);
   const branch = useStore((s) => (pending ? s.branches[pending.branchId] : undefined));
   if (!pending || !branch || nowOf(branch) < pending.node.tick) return null;
   const bot = branch.bots[pending.node.botId];
@@ -23,7 +24,7 @@ export function DecisionPanel() {
         ))}
       </div>
       <div className="dp-foot">
-        <button className="ghost" onClick={ask}>让 TA 自己决定（问模型）</button>
+        <button className="ghost" onClick={ask}>{hasModel ? '让 TA 自己决定（问模型）' : '让 TA 按性格自己决定'}</button>
       </div>
     </div>
   );

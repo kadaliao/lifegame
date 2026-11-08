@@ -68,6 +68,7 @@ export function isAbort(e: unknown): boolean {
 
 /** 限流、服务端临时错误、网络错误值得重试；4xx 里只有 408/409/429 */
 export function retryable(e: unknown): boolean {
+  if (e instanceof LlmHttpError && e.quota) return false;
   if (e instanceof LlmHttpError) return e.status === 408 || e.status === 409 || e.status === 429 || e.status >= 500;
   if (isAbort(e)) return false;
   return true;

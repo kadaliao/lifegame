@@ -127,7 +127,9 @@ function HeroToggle({ id, mode }: { id: string; mode: 'rules' | 'llm' }) {
   const setUserControl = useStore((s) => s.setUserControl);
   return (
     <div className="hero-toggle">
-      <button className={mode === 'llm' ? 'on' : ''} onClick={() => setIntelligence(id, mode === 'llm' ? 'rules' : 'llm', brain.defaultModel)} title="开启后，这个人的重大抉择由大模型以其人格决定">
+      <button className={mode === 'llm' ? 'on' : ''} onClick={() => setIntelligence(id, mode === 'llm' ? 'rules' : 'llm', brain.defaultModel)}
+        disabled={mode !== 'llm' && !brain.defaultModel}
+        title={brain.defaultModel ? '开启后，这个人的重大抉择由大模型以其人格决定' : '没有可用的模型，先在设置里填一个密钥'}>
         {mode === 'llm' ? '✦ 智能中' : '赋予智能'}
       </button>
       <button className={userControl === id ? 'on' : ''} onClick={() => setUserControl(userControl === id ? null : id)} title="开启后，每到人生节点都停下来让你来选">

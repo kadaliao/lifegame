@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import type { BotSummary } from '@lifegame/core';
-import { DEFAULT_PROVIDERS, type ProviderConfig, type UsageRecord } from '@lifegame/llm';
+import {
+  DEFAULT_PREFS, FREE_PRESET_ID, migratePrefs, probeFree, resolveBrain,
+  type BrainSource, type LlmPrefs, type SiteProvider, type UsageRecord,
+} from '@lifegame/llm';
 import type { BirthSpec, Bot, DecisionNode, WorldConfig, WorldEvent, WorldSummary } from '@lifegame/schema';
 import type { BranchInfo, BrainSettings, MainToWorker, SaveFile, StatSample, WorkerToMain } from './protocol.js';
 import { AUTOSAVE_ID, deleteSave, downloadSave, getSave, isSaveFile, listSaves, putSave, type SaveMeta } from './saves.js';
@@ -116,7 +119,18 @@ interface State {
   /** 排队和在路上的模型请求 */
   queue: number;
   errors: string[];
+  /** 交给 Worker 的模型设置：由 prefs 加上站点提供的、免费的服务推出来 */
   brain: BrainSettings;
+  /** 用户在设置里填的：各服务的密钥、选定的模型、档位 */
+  prefs: LlmPrefs;
+  /** 部署站点提供的服务（开发时是本机环境变量里的密钥） */
+  site: SiteProvider[];
+  /** 免密钥的免费服务能不能连上；还没探测过是 undefined */
+  freeOk?: boolean;
+  /** 现在用的模型从哪儿来 */
+  brainSource: BrainSource;
+  /** 本次运行里额度用完的服务 */
+  exhausted: string[];
   world: WorldSettings;
   settingsOpen: boolean;
   savesOpen: boolean;
@@ -143,7 +157,7 @@ interface State {
   fork(decisionId: string, choice: string): void;
   setActiveBranch(id: string): void;
   setCompareBranch(id: string | undefined): void;
-  setBrain(b: BrainSettings): void;
+  setPrefs(p: LlmPrefs): Promise<void>;
   setWorld(w: WorldSettings): void;
   setSettingsOpen(v: boolean): void;
   dismissError(i: number): void;
@@ -166,27 +180,23 @@ const saveRequests = new Map<string, (f: SaveFile) => void>();
 let lastAutosaveKey = '';
 let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
-const LS_BRAIN = 'lifegame.brain.v1';
-let brainSaved = false;
+const LS_PREFS = 'lifegame.llm.v2';
+const LS_BRAIN_V1 = 'lifegame.brain.v1';
 /** 画面时钟的小数部分 */
 const displayFloat = new Map<string, number>();
 const LS_WORLD = 'lifegame.world.v1';
+/** 站点提供的服务在界面上的标注 */
+export const SITE_SUFFIX = import.meta.env.DEV ? '本机密钥' : '本站提供';
 
-function loadBrain(): BrainSettings {
+function loadPrefs(): LlmPrefs {
   try {
-    const raw = localStorage.getItem(LS_BRAIN);
-    if (raw) {
-      brainSaved = true;
-      const b = JSON.parse(raw) as BrainSettings;
-      // 本机密钥的服务每次启动重新从开发服务器获取
-      b.providers = b.providers.filter((p) => !p.env);
-      // 合并新增的默认 provider
-      const ids = new Set(b.providers.map((p) => p.id));
-      for (const p of DEFAULT_PROVIDERS) if (!ids.has(p.id)) b.providers.push(p);
-      return b;
-    }
+    const raw = localStorage.getItem(LS_PREFS);
+    if (raw) return { ...DEFAULT_PREFS, ...(JSON.parse(raw) as LlmPrefs) };
+    // 旧版设置：各服务的密钥和选定的模型搬过来
+    const old = localStorage.getItem(LS_BRAIN_V1);
+    if (old) return migratePrefs(JSON.parse(old));
   } catch { /* ignore */ }
-  return { providers: DEFAULT_PROVIDERS.map((p) => ({ ...p })), defaultModel: 'mock/mock', level: 2 };
+  return { ...DEFAULT_PREFS, services: {} };
 }
 
 function loadWorld(): WorldSettings {
@@ -206,7 +216,11 @@ export const useStore = create<State>((set, get) => ({
   thinking: {},
   queue: 0,
   errors: [],
-  brain: loadBrain(),
+  brain: { providers: [], defaultModel: '', level: 0 },
+  prefs: loadPrefs(),
+  site: [],
+  brainSource: 'rules',
+  exhausted: [],
   world: loadWorld(),
   settingsOpen: false,
   savesOpen: false,
@@ -221,27 +235,21 @@ export const useStore = create<State>((set, get) => ({
     worker.onerror = (e) => set((s) => ({ errors: [...s.errors, `Worker 错误：${e.message}`] }));
     set({ worker });
     startClock(set, get);
-    // 先问开发服务器本机有哪些模型密钥，再开世界
-    loadEnvProviders().then((env) => {
-      if (env.length) {
-        const brain = get().brain;
-        const ids = new Set(env.map((p) => p.id));
-        const providers = [...env, ...brain.providers.filter((p) => !ids.has(p.id) && !p.env)];
-        const stillValid = providers.some((p) => p.models.some((m) => `${p.id}/${m}` === brain.defaultModel));
-        // 没存过设置、存的模型已失效、或者还停在假模型上，都改用本机真模型
-        const defaultModel = !brainSaved || !stillValid || brain.defaultModel.startsWith('mock/') ? `${env[0].id}/${env[0].models[0]}` : brain.defaultModel;
-        set({ brain: { ...brain, providers, defaultModel } });
-      }
-      // 有上次的自动存档就接着玩，否则开一个新世界
-      getSave(AUTOSAVE_ID)
-        .then((rec) => {
-          if (rec && isSaveFile(rec.file)) get().loadFile(rec.file);
-          else get().restart();
-        })
-        .catch(() => get().restart());
-      void get().refreshSaves();
-      setInterval(() => void autosave(get), 10_000);
-    });
+    // 先弄清楚有哪些模型可用（站点提供的、免费的），再开世界
+    loadSite()
+      .then((site) => { set({ site }); return refreshBrain(set, get); })
+      .then(() => {
+        if (get().brainSource === 'rules') get().flash('没有可用的模型，先按规则运行；在「设置」里填一个密钥，人物就会自己思考');
+        // 有上次的自动存档就接着玩，否则开一个新世界
+        getSave(AUTOSAVE_ID)
+          .then((rec) => {
+            if (rec && isSaveFile(rec.file)) get().loadFile(rec.file);
+            else get().restart();
+          })
+          .catch(() => get().restart());
+        void get().refreshSaves();
+        setInterval(() => void autosave(get), 10_000);
+      });
   },
 
   send(m) { get().worker?.postMessage(m); },
@@ -314,11 +322,12 @@ export const useStore = create<State>((set, get) => ({
     if (id && sel) askBot(get, id, sel);
   },
 
-  setBrain(b) {
-    brainSaved = true;
-    localStorage.setItem(LS_BRAIN, JSON.stringify(b));
-    set({ brain: b });
-    get().send({ type: 'setBrain', brain: b });
+  async setPrefs(p) {
+    try { localStorage.setItem(LS_PREFS, JSON.stringify(p)); } catch { /* ignore */ }
+    // 明确选了免费服务而上次没连上：再探一次
+    set({ prefs: p, ...(p.model?.startsWith(`${FREE_PRESET_ID}/`) && get().freeOk === false ? { freeOk: undefined } : {}) });
+    const brain = await refreshBrain(set, get);
+    get().send({ type: 'setBrain', brain });
   },
 
   setWorld(w) {
@@ -585,6 +594,14 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       break;
     }
     case 'error': set((s) => ({ errors: [...s.errors.slice(-4), m.message] })); break;
+    case 'exhausted': {
+      const free = m.providerId === FREE_PRESET_ID;
+      const text = free
+        ? '免费模型今天的额度用完了，之后的人生节点按各人性格决定；在「设置」里填一个密钥，人物就能接着思考'
+        : `${m.label} 的额度或余额用完了，之后的人生节点按各人性格决定；可以在「设置」里换一个服务`;
+      set((s) => ({ errors: [...s.errors.slice(-4), text], exhausted: [...s.exhausted, m.providerId] }));
+      break;
+    }
   }
 }
 
@@ -642,18 +659,31 @@ function askBot(get: Get, branchId: string, botId: string): void {
   s.send({ type: 'getBot', branchId, botId, atTick });
 }
 
-async function loadEnvProviders(): Promise<ProviderConfig[]> {
+/** 站点提供的服务：开发时是本机环境变量里的密钥，部署后是部署方放在 Vercel 环境变量里的 */
+async function loadSite(): Promise<SiteProvider[]> {
   try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 8000);
-    const res = await fetch('/llm/env', { signal: ctl.signal });
-    clearTimeout(timer);
+    const res = await fetch('/api/llm/site', { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return [];
-    const data = await res.json() as { providers: Array<{ id: string; label: string; baseUrl: string; models: string[] }> };
-    return data.providers.filter((p) => p.models.length).map((p) => ({ id: p.id, label: p.label, kind: 'openai-compatible' as const, baseUrl: p.baseUrl, models: p.models, env: true }));
+    const data = await res.json() as { providers?: SiteProvider[] };
+    return (data.providers ?? []).filter((p) => p.models?.length);
   } catch {
     return [];
   }
+}
+
+/** 按设置推出实际用的模型；需要免费服务时先探一下它能不能连上 */
+async function refreshBrain(set: Set, get: Get): Promise<BrainSettings> {
+  const { prefs, site } = get();
+  let r = resolveBrain(prefs, site, get().freeOk ?? false, SITE_SUFFIX);
+  const wantsFree = r.source === 'rules' || (prefs.model?.startsWith(`${FREE_PRESET_ID}/`) && r.source !== 'chosen');
+  if (wantsFree && get().freeOk === undefined) {
+    const freeOk = await probeFree();
+    set({ freeOk });
+    r = resolveBrain(get().prefs, site, freeOk, SITE_SUFFIX);
+  }
+  const brain: BrainSettings = { providers: r.providers, defaultModel: r.defaultModel, level: r.level };
+  set({ brain, brainSource: r.source });
+  return brain;
 }
 
 export function useBranch(id?: string): BranchData | undefined {

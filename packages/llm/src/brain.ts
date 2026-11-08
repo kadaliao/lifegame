@@ -5,7 +5,7 @@ import {
 } from '@lifegame/schema';
 import type { z } from 'zod';
 import { decisionMessages, portraitMessages, reflectionMessages } from './prompts.js';
-import { hashString, type CompleteResult, type LlmMessage, type Provider } from './provider.js';
+import { LlmHttpError, hashString, type CompleteResult, type LlmMessage, type Provider } from './provider.js';
 import { Limiter, backoffMs, isAbort, retryable, sleep } from './scheduler.js';
 
 export interface UsageRecord {
@@ -57,6 +57,10 @@ export interface BrainOptions {
   cache?: Map<string, CompleteResult>;
   onUsage?: (usage: UsageRecord, last: { model: string; usage: CompleteResult['usage'] }) => void;
   onTrace?: (trace: { kind: string; botId: string; messages: LlmMessage[]; result: string; ms: number }) => void;
+  /** 以前的默认模型："服务/模型"。记着这些模型的人跟着现在的默认模型走（在设置里换了模型，不用重开世界） */
+  followDefault?: string[];
+  /** 某个服务的额度用完了（每个服务只报一次）；之后发给它的请求直接失败，不再联网 */
+  onExhausted?: (providerId: string, error: LlmHttpError) => void;
 }
 
 /** 负责把世界状态变成提示词、调用模型、解析结果 */
@@ -64,6 +68,8 @@ export class Brain {
   readonly usage = emptyUsage();
   private cache: Map<string, CompleteResult>;
   private limiters = new Map<string, Limiter>();
+  /** 额度用完的服务 */
+  private exhausted = new Map<string, LlmHttpError>();
   /** 同一指纹的请求在路上时，后来者共享它 */
   private sharing = new Map<string, Promise<CompleteResult>>();
 
@@ -76,6 +82,14 @@ export class Brain {
     let n = 0;
     for (const l of this.limiters.values()) n += l.depth;
     return n;
+  }
+
+  /** 这个人用的模型。跟着以前的默认模型的、记录的服务不在了（读别处的存档）或额度用完的，用现在的默认模型 */
+  private refOf(bot: Bot): ModelRef {
+    if (bot.model && this.opts.followDefault?.includes(bot.model)) return this.opts.defaultModel;
+    const ref = parseModelRef(bot.model, this.opts.defaultModel);
+    if (!this.opts.providers[ref.providerId] || this.exhausted.has(ref.providerId)) return this.opts.defaultModel;
+    return ref;
   }
 
   private limiter(providerId: string): Limiter {
@@ -95,7 +109,7 @@ export class Brain {
    */
   prepare(world: World, node: DecisionNode): Prepared {
     const bot = world.bot(node.botId)!;
-    const ref = parseModelRef(bot.model, this.opts.defaultModel);
+    const ref = this.refOf(bot);
     const model = `${ref.providerId}/${ref.model}`;
     if (node.kind === REFLECT_KIND) {
       const messages = reflectionMessages(world, bot, node.data?.stage as LifeStage);
@@ -127,19 +141,19 @@ export class Brain {
     const bot = world.bot(node.botId)!;
     // 主角的请求永远排在配角前面，同级按到期先后
     const priority = (bot.lead ? -1e6 : 0) + node.dueTick;
-    const ref = parseModelRef(bot.model, this.opts.defaultModel);
+    const ref = this.refOf(bot);
     const messages = decisionMessages(world, bot, node);
     const out = await this.call('decide', bot.id, ref, messages, LlmDecisionOutput, priority, signal, (raw) => fixChoice(node, raw));
     return { ...out, model: `${ref.providerId}/${ref.model}` };
   }
 
   async reflect(world: World, bot: Bot, endedStage: LifeStage): Promise<LlmReflectionOutput> {
-    const ref = parseModelRef(bot.model, this.opts.defaultModel);
+    const ref = this.refOf(bot);
     return this.call('reflect', bot.id, ref, reflectionMessages(world, bot, endedStage), LlmReflectionOutput, 1e6 + world.tick, undefined);
   }
 
   async portrait(world: World, bot: Bot): Promise<string> {
-    const ref = parseModelRef(bot.model, this.opts.defaultModel);
+    const ref = this.refOf(bot);
     const out = await this.call('portrait', bot.id, ref, portraitMessages(world, bot), LlmPortraitOutput, 1e6 + world.tick, undefined);
     return out.portrait;
   }
@@ -149,13 +163,15 @@ export class Brain {
     priority: number, signal: AbortSignal | undefined, fix?: (raw: T) => T,
   ): Promise<T> {
     const provider = this.opts.providers[ref.providerId];
-    if (!provider) throw new Error(`未配置模型服务 ${ref.providerId}`);
+    if (!provider) throw new Error(Object.keys(this.opts.providers).length ? `未配置模型服务 ${ref.providerId}` : '没有可用的模型，可以在设置里填一个密钥');
     const key = `${ref.providerId}/${ref.model}:${hashString(JSON.stringify(messages))}`;
     const t0 = Date.now();
     let res = this.cache.get(key);
     if (res) {
       this.usage.cacheHits++;
     } else {
+      const spent = this.exhausted.get(ref.providerId);
+      if (spent) throw spent;
       let lastErr: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
@@ -199,9 +215,17 @@ export class Brain {
     const limiter = this.limiter(ref.providerId);
     for (let attempt = 0; ; attempt++) {
       try {
-        return await limiter.schedule(priority, () => provider.complete({ model: ref.model, messages, json: true }, signal), signal);
+        // 排队期间额度可能已经用完，轮到时再看一眼
+        return await limiter.schedule(priority, () => {
+          const spent = this.exhausted.get(ref.providerId);
+          return spent ? Promise.reject(spent) : provider.complete({ model: ref.model, messages, json: true }, signal);
+        }, signal);
       } catch (e) {
         if (isAbort(e)) throw e;
+        if (e instanceof LlmHttpError && e.quota && !this.exhausted.has(ref.providerId)) {
+          this.exhausted.set(ref.providerId, e);
+          this.opts.onExhausted?.(ref.providerId, e);
+        }
         if (attempt >= 4 || !retryable(e)) throw e;
         this.usage.errors++;
         await sleep(backoffMs(attempt, e));

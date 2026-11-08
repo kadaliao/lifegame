@@ -100,8 +100,17 @@ function handle(msg: MainToWorker): void {
     }
     case 'fork': return fork(msg.decisionId, msg.choice);
     case 'setBrain': {
+      const before = brainSettings && JSON.stringify([brainSettings.defaultModel, brainSettings.providers]);
       setBrain(msg.brain);
-      for (const br of branches.values()) br.director.brain = brain!;
+      const changed = before !== JSON.stringify([msg.brain.defaultModel, msg.brain.providers]);
+      for (const br of branches.values()) {
+        br.director.brain = brain!;
+        // 换了模型：退回画面所在位置，此后的节点用新模型重做（之前可能是额度用完时按性格定的）
+        if (changed) br.director.change(() => undefined);
+      }
+      const br = branches.get(activeId);
+      if (changed && br) flush(br, [], true);
+      wake();
       return;
     }
     case 'getBot': {
@@ -135,16 +144,23 @@ function handle(msg: MainToWorker): void {
   }
 }
 
+/** 这次运行里用过的默认模型 */
+const pastDefaults = new Set<string>();
+
 function setBrain(settings: BrainSettings): void {
+  if (brainSettings?.defaultModel) pastDefaults.add(brainSettings.defaultModel);
+  pastDefaults.delete(settings.defaultModel);
   brainSettings = settings;
   const providers: Record<string, Provider> = {};
   for (const p of settings.providers) providers[p.id] = createProvider(p);
   const [providerId, ...rest] = settings.defaultModel.split('/');
   brain = new Brain({
     providers,
-    defaultModel: { providerId, model: rest.join('/') || 'mock' },
-    concurrency: 4,
+    defaultModel: { providerId, model: rest.join('/') },
+    followDefault: [...pastDefaults],
+    concurrency: Object.fromEntries(settings.providers.map((p) => [p.id, p.concurrency ?? 4])),
     onUsage: (usage) => post({ type: 'usage', usage: { ...usage }, queue: brain?.queueDepth ?? 0 }),
+    onExhausted: (id) => post({ type: 'exhausted', providerId: id, label: settings.providers.find((p) => p.id === id)?.label ?? id }),
   });
 }
 

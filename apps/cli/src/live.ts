@@ -4,13 +4,14 @@
  *   pnpm cli:live -- --heroes=12 --leads=3 --speed=2 --level=1 --quiet
  *       模拟一个 2 年/秒播放的画面：前 3 人是主角，其余和继承来的子女是配角，统计用户实际会看到的停顿。
  * 不加 --speed 时没有画面，世界总是等模型（从不推测）。
- * 密钥从环境变量读，不会打印。结果写到 runs/。
+ *   pnpm cli:live -- --model=llm7/mistral-Nemo-Instruct-2407   免密钥的免费模型
+ * 密钥从环境变量读（各服务的变量名见 packages/llm/src/presets.ts 的 envKey），不会打印。结果写到 runs/。
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { World, stageName } from '@lifegame/core';
 import { getEra } from '@lifegame/eras';
-import { Brain, Director, ENV_PROVIDERS, MockProvider, createProvider, envProviderConfig, favorite, type LlmMessage, type Provider } from '@lifegame/llm';
+import { Brain, Director, MockProvider, PRESETS, createProvider, favorite, type LlmMessage, type Provider } from '@lifegame/llm';
 import { tickToYearMonth, type DecisionNode, type LifeStage } from '@lifegame/schema';
 
 const args = Object.fromEntries(process.argv.slice(2).filter((a) => a.startsWith('--')).map((a) => {
@@ -34,8 +35,13 @@ const speed = Number(args.speed ?? 0);
 const ahead = speed ? Math.max(60, Math.min(600, Math.round(speed * 12 * 12))) : Infinity;
 
 const providers: Record<string, Provider> = { mock: new MockProvider() };
-for (const def of ENV_PROVIDERS) {
-  if (process.env[def.envKey]) providers[def.id] = createProvider(envProviderConfig(def, process.env, []));
+const limits: Record<string, number> = { mock: concurrency };
+for (const p of PRESETS) {
+  if (p.id === 'mock' || p.editableUrl) continue;
+  const apiKey = p.envKey ? process.env[p.envKey] : undefined;
+  if (p.key === 'required' && !apiKey) continue;
+  providers[p.id] = createProvider({ id: p.id, kind: 'openai-compatible', baseUrl: p.baseUrl, apiKey, models: [] });
+  limits[p.id] = Math.min(concurrency, p.concurrency ?? concurrency);
 }
 if (!providers[providerId]) {
   console.error(`没有 ${providerId} 的密钥。可用：${Object.keys(providers).join(', ')}`);
@@ -44,7 +50,7 @@ if (!providers[providerId]) {
 
 interface Trace { kind: string; botId: string; ms: number; messages: LlmMessage[]; result: string }
 const traces: Trace[] = [];
-const brain = new Brain({ providers, defaultModel: { providerId, model }, concurrency, onTrace: (t) => traces.push(t) });
+const brain = new Brain({ providers, defaultModel: { providerId, model }, concurrency: limits, onTrace: (t) => traces.push(t) });
 
 const era = getEra('china-modern');
 const world = World.create(era, { seed, eraId: era.id, population, startYear: era.defaultStartYear, endYear, birthSpan: era.defaultBirthSpan });
@@ -102,7 +108,7 @@ function report(node: DecisionNode) {
 }
 
 async function main() {
-  log(`模型 ${modelRef} · 种子 ${seed} · 智能人格 ${heroes.length} 人（主角 ${Math.min(leadCount, heroes.length)}） · 并发 ${concurrency} · 档位 ${level}${speed ? ` · 画面 ${speed} 年/秒` : ''}`);
+  log(`模型 ${modelRef} · 种子 ${seed} · 智能人格 ${heroes.length} 人（主角 ${Math.min(leadCount, heroes.length)}） · 并发 ${limits[providerId]} · 档位 ${level}${speed ? ` · 画面 ${speed} 年/秒` : ''}`);
   const t0 = Date.now();
   let blockedMs = 0;
   let guard = 0;

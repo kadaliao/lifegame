@@ -27,12 +27,48 @@ pnpm cli -- --pop=200 --seed=42 --idx=3   # 无界面跑一个世界并打印第
 pnpm test
 ```
 
-**真模型**：开发服务器启动时会读本机环境变量里的密钥（`AIHUBMIX_API_KEY`、`DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY`），拉取这把密钥能用的模型，自动设为默认。浏览器经开发服务器的 `/llm/<服务>` 代理访问，密钥留在 Node 侧，不进前端代码；代理只接受同源请求。没有密钥时用内置的假模型零成本跑通全部流程，也可以在「设置」里手填其他 OpenAI 兼容接口或本地 Ollama（需要 `OLLAMA_ORIGINS=*`）。
+## 模型
+
+在「设置 → 智能 → 模型服务」里选一家、填密钥、选模型，点「测试」就知道能不能用。预置了二十来家 OpenAI 兼容的服务：
+
+| 分组 | 服务 |
+|---|---|
+| 免费 | LLM7（不注册、不填密钥就能用） |
+| 国内 | DeepSeek、硅基流动、智谱 GLM、阿里云百炼、月之暗面 Kimi、火山方舟、腾讯混元、百度千帆、阶跃星辰、MiniMax、AIHubMix |
+| 海外 | OpenRouter、OpenAI、Google Gemini、Anthropic、Groq、Cerebras、Mistral、xAI |
+| 本地 | Ollama、LM Studio，以及任意自定义的 OpenAI 兼容地址 |
+
+填了密钥会向 `/models` 拉这把密钥实际能用的模型；预置的模型名只是推荐，也可以直接填。不少服务有免费的模型或额度（硅基流动的 Qwen3-8B、智谱的 GLM Flash、混元 lite、OpenRouter 带 `:free` 的模型、Gemini、Groq、Cerebras 的免费额度），设置里每家都写了。
+
+**没有设置时自动挑**，顺序是：
+
+1. 你在设置里选定的；
+2. 你填了密钥的服务；
+3. 部署站点提供的服务（部署方放在环境变量里的密钥，见下文）；
+4. 免密钥的免费服务 LLM7（开局先探一下能不能连上）；
+5. 都没有：纯规则运行，开局会提示。
+
+LLM7 匿名使用每人同时只能发 1 个请求，每天有 token 上限。额度用完时只提示一次，之后的人生节点按各人性格决定，世界不会卡住；在设置里填一个密钥并保存，画面之后的节点会用新模型重做，不用重开世界。
+
+**密钥去哪儿了**：密钥只存在你的浏览器（localStorage）里。允许网页跨域调用的服务由浏览器直接请求，不经过任何服务器；智谱、腾讯混元、Anthropic 不允许，经本站的 `/api/llm/<服务>` 转发（只转发到预置地址，不记录）。
+
+**开发时**：`pnpm dev` 会把本机环境变量里的密钥（`DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY`、`AIHUBMIX_API_KEY` 等，变量名见 `packages/llm/src/presets.ts` 的 `envKey`）当作"站点提供"的服务，标着"本机密钥"。密钥留在 Node 侧，浏览器经 `/api/llm/site/<服务>` 访问，代理只接受同源请求。
 
 ```bash
-pnpm cli:live -- --model=aihubmix/qwen3-vl-plus --seed=42              # 用真模型活一条人生，打印独白与反思
+pnpm cli:live -- --model=deepseek/deepseek-flash --seed=42             # 用真模型活一条人生，打印独白与反思
+pnpm cli:live -- --model=llm7/mistral-Nemo-Instruct-2407 --heroes=1    # 免密钥的免费模型
 pnpm cli:live -- --heroes=12 --leads=3 --speed=2 --level=1 --quiet     # 压力测试：模拟 2 年/秒的画面，统计可见停顿
 ```
+
+## 部署到 Vercel
+
+仓库根目录的 `vercel.json` 已经配好：用 pnpm 安装，构建 `apps/web`，静态页面加一个函数 `api/llm.ts`（模型代理，和开发服务器共用 `packages/llm/src/proxy.ts`）。
+
+1. 在 Vercel 导入这个仓库，Root Directory 保持仓库根目录，其余用默认（框架选 Other，构建命令和输出目录会从 `vercel.json` 读）。
+2. 不配任何环境变量也能用：访客没填密钥时用免费的 LLM7，连不上就按规则。
+3. 想让访客不填密钥就用你的模型，在 Project → Settings → Environment Variables 里加对应的密钥，比如 `DEEPSEEK_API_KEY`、`SILICONFLOW_API_KEY`、`ZHIPU_API_KEY`。默认放行 `/models` 拉到的全部模型；加 `DEEPSEEK_MODELS=deepseek-flash` 这样的变量只放行列出的几个。注意这相当于请访客用你的额度，站点公开时最好只放免费或便宜的模型。
+
+本地验证部署产物：`npx vercel build`（需要先 `vercel link`，或手写 `.vercel/project.json`），产物在 `.vercel/output`。
 
 ## 玩法
 
@@ -52,9 +88,10 @@ pnpm cli:live -- --heroes=12 --leads=3 --speed=2 --level=1 --quiet     # 压力�
 packages/schema   zod/TS 类型：Bot、WorldEvent、DecisionNode、WorldState
 packages/core     确定性引擎：xoshiro128** RNG、tick 循环、事件日志、年快照、分叉回放
 packages/eras     时代包（当前：当代中国 1980–2060）：出生/人格、阶段钩子、决策、随机事件、历史时间线
-packages/llm      模型适配层：OpenAI 兼容 provider、mock、提示词、结构化解析、缓存与用量
+packages/llm      模型适配层：OpenAI 兼容 provider、预置服务、选模型、代理、提示词、结构化解析、缓存与用量
 apps/web          React + PixiJS；引擎与模型调用跑在 Web Worker
 apps/cli          无界面批量运行
+api/llm.ts        Vercel 函数：模型代理
 ```
 
 ## 时代怎样作用于个人

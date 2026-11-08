@@ -3,7 +3,7 @@ import { World } from '@lifegame/core';
 import { chinaModern } from '../../eras/src/index.js';
 import { Brain } from './brain.js';
 import { Director } from './director.js';
-import { MockProvider, type CompleteRequest, type CompleteResult } from './provider.js';
+import { LlmHttpError, MockProvider, type CompleteRequest, type CompleteResult, type Provider } from './provider.js';
 
 /** 内容确定、但回答时间随机的假模型 */
 class JitteryMock extends MockProvider {
@@ -108,4 +108,17 @@ describe('Director', () => {
     await finish(d2);
     expect(texts(d2.world)).toEqual(texts(d.world));
   }, 90_000);
+
+  it('主角的请求失败时，已经落地的推测就此定下，不让画面干等', async () => {
+    // 稍等一会儿才失败：主角到期时还没有答复，先推测着走了
+    const failing: Provider = { id: 'mock', complete: async () => { await new Promise((r) => setTimeout(r, 15)); throw new LlmHttpError('LLM 400: bad', 400); } };
+    const brain = new Brain({ providers: { mock: failing }, defaultModel: { providerId: 'mock', model: 'mock' }, concurrency: 3 });
+    const d: Director = new Director(makeWorld({ heroes: 3 }), brain, { display: () => d.world.tick, ahead: () => 24 });
+    const t0 = Date.now();
+    await finish(d);
+    expect(d.world.finished).toBe(true);
+    expect(d.stats.provisional).toBeGreaterThan(0);
+    expect(d.world.provisional).toEqual([]);
+    expect(Date.now() - t0).toBeLessThan(20_000);
+  }, 30_000);
 });

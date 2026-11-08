@@ -131,9 +131,18 @@ blockquote.reflection { margin: 10px 0 0; padding: 10px 14px; background: rgba(2
 .modal .row { display: flex; gap: 12px; flex-wrap: wrap; }
 .modal label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .modal label input, .modal label select { color: var(--ink); min-width: 120px; }
-.provider { display: grid; grid-template-columns: 110px 1fr 1fr 1fr; gap: 8px; align-items: center; margin: 6px 0; }
-.provider-env { grid-column: 2 / -1; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal label.grow { flex: 1; min-width: 200px; }
+.modal label.grow input, .modal label.grow select { width: 100%; }
+.svc { margin: 10px 0 4px; padding: 10px 12px 4px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.45); }
+.svc p { margin: 0 0 8px; }
+.svc a { color: var(--accent); }
+.svc-actions { align-items: center; margin: 8px 0; }
+.site-note { color: #3f6b3a; }
+.good { color: #3f6b3a; }
+.bad { color: var(--accent); }
+.preview { margin: 10px 0 0; padding: 6px 10px; border-radius: 6px; background: rgba(43,38,34,.05); }
+.preview.warn { color: var(--accent); background: rgba(200,54,47,.07); }
 code { background: rgba(0,0,0,.06); padding: 0 4px; border-radius: 3px; }
 
 .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 6px; z-index: 40; }
