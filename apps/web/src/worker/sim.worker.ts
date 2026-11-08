@@ -1,8 +1,16 @@
 /// <reference lib="webworker" />
+/**
+ * 模拟线程。要点：
+ * - 模拟领先画面一段（ahead），模型的思考时间藏在这段缓冲里。
+ * - 智能角色提出决策后立刻发请求，世界不停；答案在犹豫期结束时生效。
+ *   只有到期了答案还没回来，世界才停下来等。所以很多人同时在想，等待是重叠的，不是累加的。
+ * - 画面追上来、世界又为某个答案卡了太久，就按这个人最可能的选择先走下去。
+ * - 在画面之后改变某人的设定（赋予智能、由你掌控），会把模拟退回画面所在年份重放。
+ */
 import { World, summarize, type BotSummary } from '@lifegame/core';
 import { getEra } from '@lifegame/eras';
 import { Brain, createProvider, type Provider } from '@lifegame/llm';
-import type { Bot, DecisionNode, LifeStage, WorldEvent } from '@lifegame/schema';
+import type { DecisionNode, LifeStage, WorldEvent } from '@lifegame/schema';
 import type { BranchInfo, BrainSettings, MainToWorker, StatSample, WorkerToMain } from '../protocol.js';
 
 interface Branch {
@@ -13,23 +21,58 @@ interface Branch {
 
 const post = (m: WorkerToMain) => (self as unknown as Worker).postMessage(m);
 
+/** 画面追上模拟后，为一个答案最多等多久就兜底 */
+const FALLBACK_MS = 30_000;
+const STAGE_ORDER: LifeStage[] = ['infant', 'child', 'teen', 'youth', 'adult', 'middle', 'senior'];
+
 const branches = new Map<string, Branch>();
 let activeId = 'main';
-let playing = false;
 let loopRunning = false;
-let ticksPerSecond = 24;
+const displayAt = new Map<string, number>();
+let aheadTicks = 72;
 let brain: Brain | undefined;
 let brainSettings: BrainSettings | undefined;
 let userControl: string | null = null;
-let waitingUser: { branchId: string; decisionId: string; resolve: (v: { choice: string; by: 'user' | 'llm'; monologue?: string; model?: string }) => void } | undefined;
-let catchUpTarget: number | undefined;
 
-const STAGE_ORDER: LifeStage[] = ['infant', 'child', 'teen', 'youth', 'adult', 'middle', 'senior'];
+/** 在路上的模型请求：key = 分支:决策 → 取消开关 */
+const inflight = new Map<string, AbortController>();
+
+/** 取消某个分支（或全部）在路上的请求：已经用不上的答案不必再花钱 */
+function abortInflight(branchId?: string): void {
+  for (const [k, c] of [...inflight]) {
+    if (branchId && !k.startsWith(`${branchId}:`)) continue;
+    c.abort();
+    // 同步删掉：回退后的新世界会复用同样的决策编号
+    inflight.delete(k);
+  }
+}
+/** 等用户回答的决策 */
+const userWaits = new Map<string, DecisionNode>();
+let shownUserKey: string | undefined;
+/** 用户点了"让 TA 自己决定"的决策 */
+const forceBrain = new Set<string>();
+/** 世界为某个答案停下的起始时间（只在画面追上来之后计） */
+const blockedSince = new Map<string, number>();
+
+// 有答案回来时立刻唤醒模拟循环
+let wakeUp: (() => void) | undefined;
+function wake(): void {
+  const w = wakeUp;
+  wakeUp = undefined;
+  w?.();
+}
+function idle(ms: number): Promise<void> {
+  return new Promise((r) => {
+    const t = setTimeout(() => { wakeUp = undefined; r(); }, ms);
+    wakeUp = () => { clearTimeout(t); r(); };
+  });
+}
+
+const keyOf = (br: Branch, id: string) => `${br.info.id}:${id}`;
 
 self.onmessage = (e: MessageEvent<MainToWorker>) => {
-  const msg = e.data;
   try {
-    handle(msg);
+    handle(e.data);
   } catch (err) {
     post({ type: 'error', message: String(err) });
   }
@@ -38,35 +81,56 @@ self.onmessage = (e: MessageEvent<MainToWorker>) => {
 function handle(msg: MainToWorker): void {
   switch (msg.type) {
     case 'init': return init(msg.config, msg.brain, msg.heroCount);
-    case 'play': playing = true; post({ type: 'playing', playing: true }); void loop(); return;
-    case 'pause': playing = false; post({ type: 'playing', playing: false }); return;
-    case 'speed': ticksPerSecond = msg.ticksPerSecond; return;
+    case 'display':
+      displayAt.set(msg.branchId, msg.tick);
+      aheadTicks = msg.ahead;
+      wake();
+      return;
     case 'setIntelligence': {
-      for (const b of branches.values()) b.world.setIntelligence(msg.botId, msg.mode, msg.model);
+      for (const br of branches.values()) {
+        rewindIfAhead(br, msg.botId);
+        br.world.setIntelligence(msg.botId, msg.mode, msg.model);
+      }
       const br = branches.get(activeId);
-      if (br) post({ type: 'tick', branchId: br.info.id, summary: br.world.summary(), events: [], bots: allSummaries(br.world), finished: br.world.finished });
+      if (br) flush(br, [], true);
+      wake();
       return;
     }
-    case 'setUserControl': userControl = msg.botId; return;
+    case 'setUserControl': {
+      const prev = userControl;
+      userControl = msg.botId;
+      if (msg.botId) {
+        const br = branches.get(activeId);
+        if (br) rewindIfAhead(br, msg.botId);
+      }
+      // 不再掌控：把等着用户的决策交还给模型
+      if (prev && prev !== msg.botId) {
+        for (const [k, n] of userWaits) if (n.botId === prev) { userWaits.delete(k); if (shownUserKey === k) shownUserKey = undefined; }
+      }
+      wake();
+      return;
+    }
     case 'resolve': {
-      if (waitingUser && waitingUser.decisionId === msg.decisionId) {
-        const w = waitingUser; waitingUser = undefined;
-        w.resolve({ choice: msg.choice, by: 'user' });
+      const br = branches.get(msg.branchId);
+      const k = br ? keyOf(br, msg.decisionId) : '';
+      if (br && userWaits.has(k)) {
+        userWaits.delete(k);
+        shownUserKey = undefined;
+        br.world.resolveDecision(msg.decisionId, msg.choice, 'user');
+        postNextUserWait(br);
+        wake();
       }
       return;
     }
     case 'askBrain': {
-      if (waitingUser && waitingUser.decisionId === msg.decisionId) {
-        const br = branches.get(msg.branchId);
-        const node = br?.world.state.decisions[msg.decisionId];
-        if (br && node && brain) {
-          const w = waitingUser; waitingUser = undefined;
-          post({ type: 'thinking', branchId: br.info.id, botId: node.botId, kind: node.kind, on: true });
-          brain.decide(br.world, node)
-            .then((r) => w.resolve({ choice: r.choice, by: 'llm', monologue: r.monologue, model: r.model }))
-            .catch((err) => { post({ type: 'error', message: `模型调用失败：${String(err)}` }); w.resolve({ choice: node.options[0].id, by: 'user' }); })
-            .finally(() => post({ type: 'thinking', branchId: br.info.id, botId: node.botId, kind: node.kind, on: false }));
-        }
+      const br = branches.get(msg.branchId);
+      const k = br ? keyOf(br, msg.decisionId) : '';
+      if (br && userWaits.has(k)) {
+        userWaits.delete(k);
+        shownUserKey = undefined;
+        forceBrain.add(k);
+        dispatch(br);
+        postNextUserWait(br);
       }
       return;
     }
@@ -76,7 +140,7 @@ function handle(msg: MainToWorker): void {
       const br = branches.get(msg.branchId);
       const bot = br?.world.bot(msg.botId);
       if (br && bot) {
-        const decisions = Object.values(br.world.state.decisions).filter((d) => d.botId === bot.id);
+        const decisions = Object.values(br.world.state.decisions).filter((d) => d.botId === bot.id && d.applied);
         post({ type: 'bot', branchId: br.info.id, bot, samples: br.samples.get(bot.id) ?? [], decisions });
       }
       return;
@@ -84,8 +148,8 @@ function handle(msg: MainToWorker): void {
     case 'setActiveBranch': {
       if (branches.has(msg.branchId)) {
         activeId = msg.branchId;
-        const br = branches.get(activeId)!;
-        post({ type: 'tick', branchId: br.info.id, summary: br.world.summary(), events: [], bots: allSummaries(br.world), finished: br.world.finished });
+        flush(branches.get(activeId)!, [], true);
+        wake();
       }
       return;
     }
@@ -100,14 +164,20 @@ function setBrain(settings: BrainSettings): void {
   brain = new Brain({
     providers,
     defaultModel: { providerId, model: rest.join('/') || 'mock' },
-    onUsage: (usage) => post({ type: 'usage', usage: { ...usage } }),
+    concurrency: 4,
+    onUsage: (usage) => post({ type: 'usage', usage: { ...usage }, queue: brain?.queueDepth ?? 0 }),
   });
 }
 
 function init(config: Parameters<typeof World.create>[1], settings: BrainSettings, heroCount: number): void {
-  playing = false;
+  abortInflight();
   branches.clear();
-  waitingUser = undefined;
+  displayAt.clear();
+  inflight.clear();
+  userWaits.clear();
+  forceBrain.clear();
+  blockedSince.clear();
+  shownUserKey = undefined;
   const era = getEra(config.eraId);
   const world = World.create(era, config);
   setBrain(settings);
@@ -122,17 +192,19 @@ function init(config: Parameters<typeof World.create>[1], settings: BrainSetting
   const br: Branch = { info: { id: 'main', label: '主线' }, world, samples: new Map() };
   branches.set('main', br);
   activeId = 'main';
+  displayAt.set('main', 0);
   post({
     type: 'ready', branch: br.info, config, bots: allSummaries(world),
     era: { id: era.id, name: era.name, description: era.description, theme: era.theme },
   });
-  // 主角的命运旁白
   if (settings.level >= 2 && brain) {
     for (const id of heroes) {
       const bot = world.bot(id)!;
       brain.portrait(world, bot).then((p) => { bot.portrait = p; }).catch(() => undefined);
     }
   }
+  void loop();
+  wake();
 }
 
 function allSummaries(world: World): BotSummary[] {
@@ -145,55 +217,136 @@ function allSummaries(world: World): BotSummary[] {
     });
 }
 
+// ---------- 模拟循环 ----------
+
 async function loop(): Promise<void> {
   if (loopRunning) return;
   loopRunning = true;
-  try {
-    while (playing) {
-      const br = branches.get(activeId);
-      if (!br) break;
-      const frameMs = 1000 / 30;
-      const perFrame = Number.isFinite(ticksPerSecond) ? Math.max(1, Math.round(ticksPerSecond / 30)) : 10_000;
-      const t0 = performance.now();
-      let count = 0;
-      const events: WorldEvent[] = [];
-      let sentBots = false;
-      while (playing && count < perFrame && performance.now() - t0 < 14) {
-        if (br.world.finished) { playing = false; post({ type: 'playing', playing: false }); break; }
-        if (catchUpTarget !== undefined && br.world.tick >= catchUpTarget) {
-          catchUpTarget = undefined;
-          playing = false;
-          post({ type: 'playing', playing: false });
-          break;
-        }
-        const res = br.world.step();
-        count++;
-        events.push(...res.events);
-        afterStep(br, res.events);
-        if (br.world.tick % 12 === 0) {
-          sampleAll(br);
-          flush(br, events.splice(0), true);
-          sentBots = true;
-        }
-        if (res.pending.length) {
-          flush(br, events.splice(0), !sentBots);
-          await handlePending(br);
-        }
-      }
-      if (events.length) flush(br, events, !sentBots);
-      if (!Number.isFinite(ticksPerSecond)) await sleep(0);
-      else {
-        const elapsed = performance.now() - t0;
-        await sleep(Math.max(0, frameMs - elapsed));
+  for (;;) {
+    const br = branches.get(activeId);
+    if (!br) { await idle(60); continue; }
+    dispatch(br);
+    const target = (displayAt.get(br.info.id) ?? 0) + aheadTicks;
+    if (br.world.finished || br.world.tick >= target) { await idle(40); continue; }
+    const t0 = performance.now();
+    const events: WorldEvent[] = [];
+    let sentBots = false;
+    let blocked: DecisionNode[] = [];
+    while (performance.now() - t0 < 12 && !br.world.finished && br.world.tick < target && branches.get(activeId) === br) {
+      const res = br.world.step();
+      events.push(...res.events);
+      afterStep(br, res.events);
+      if (res.pending.length) dispatch(br);
+      if (res.blocked.length) { blocked = res.blocked; break; }
+      if (br.world.tick % 12 === 0) {
+        sampleAll(br);
+        flush(br, events.splice(0), true);
+        sentBots = true;
       }
     }
-  } finally {
-    loopRunning = false;
+    if (events.length || blocked.length) flush(br, events, !sentBots);
+    if (blocked.length) {
+      fallbackIfStuck(br, blocked);
+      await idle(50);
+    } else {
+      blockedSince.clear();
+      await idle(0);
+    }
+  }
+}
+
+/** 给所有还没答案的决策发请求（或交给用户） */
+function dispatch(br: Branch): void {
+  const world = br.world;
+  for (const node of world.pending) {
+    const k = keyOf(br, node.id);
+    if (inflight.has(k) || userWaits.has(k)) continue;
+    if (userControl === node.botId && br.info.id === activeId && !forceBrain.has(k)) {
+      userWaits.set(k, node);
+      postNextUserWait(br);
+      continue;
+    }
+    const bot = world.bot(node.botId);
+    if (!brain || !bot) {
+      world.resolveDecision(node.id, favorite(node), 'auto');
+      continue;
+    }
+    const ctl = new AbortController();
+    inflight.set(k, ctl);
+    post({ type: 'thinking', branchId: br.info.id, botId: node.botId, kind: node.kind, on: true });
+    brain.decide(world, node, ctl.signal)
+      .then((r) => {
+        if (br.world !== world) return; // 期间被回退或重开
+        if (r.goal) bot.goal = r.goal;
+        world.resolveDecision(node.id, r.choice, 'llm', r.monologue, r.model);
+      })
+      .catch((err) => {
+        if (br.world !== world || ctl.signal.aborted) return;
+        post({ type: 'error', message: `${bot.name}的模型请求失败，按性格先选了：${String(err).slice(0, 120)}` });
+        world.resolveDecision(node.id, favorite(node), 'auto', '（来不及细想，凭直觉选了）');
+      })
+      .finally(() => {
+        if (inflight.get(k) === ctl) inflight.delete(k);
+        forceBrain.delete(k);
+        post({ type: 'thinking', branchId: br.info.id, botId: node.botId, kind: node.kind, on: false });
+        wake();
+      });
+  }
+}
+
+/** 这个人最可能的选择：规则权重最高的那项（不消耗随机数，保证可重放） */
+function favorite(node: DecisionNode): string {
+  return node.options.reduce((a, b) => ((b.weight ?? 1) > (a.weight ?? 1) ? b : a)).id;
+}
+
+/**
+ * 配角：只在缓冲充裕（模拟领先画面超过一半缓冲）时等模型，否则立刻凭直觉，把缓冲留给主角。
+ * 主角：画面追上之前的等待用户看不见；追上之后最多再等 FALLBACK_MS。
+ */
+function fallbackIfStuck(br: Branch, blocked: DecisionNode[]): void {
+  const display = displayAt.get(br.info.id) ?? 0;
+  const lead = br.world.tick - display;
+  const now = performance.now();
+  for (const n of blocked) {
+    const k = keyOf(br, n.id);
+    if (userWaits.has(k)) continue; // 等用户的不兜底
+    const bot = br.world.bot(n.botId);
+    if (!bot?.lead) {
+      if (lead > aheadTicks / 2) continue;
+      br.world.resolveDecision(n.id, favorite(n), 'auto', '（来不及细想，凭直觉选了）');
+      inflight.get(k)?.abort();
+      continue;
+    }
+    if (lead > 1) continue;
+    const since = blockedSince.get(k) ?? now;
+    blockedSince.set(k, since);
+    if (now - since > FALLBACK_MS) {
+      blockedSince.delete(k);
+      br.world.resolveDecision(n.id, favorite(n), 'auto', '（想了太久，最后凭直觉选了）');
+      inflight.get(k)?.abort();
+      post({ type: 'error', message: `${bot.name}的模型答复超时，按性格先选了` });
+    }
+  }
+}
+
+function postNextUserWait(br: Branch): void {
+  if (shownUserKey && userWaits.has(shownUserKey)) return;
+  let next: [string, DecisionNode] | undefined;
+  for (const e of userWaits) {
+    if (!e[0].startsWith(`${br.info.id}:`)) continue;
+    if (!next || e[1].dueTick < next[1].dueTick) next = e;
+  }
+  if (next) {
+    shownUserKey = next[0];
+    post({ type: 'pending', branchId: br.info.id, node: next[1], needsUser: true });
   }
 }
 
 function flush(br: Branch, events: WorldEvent[], withBots: boolean): void {
   post({ type: 'tick', branchId: br.info.id, summary: br.world.summary(), events, bots: withBots ? allSummaries(br.world) : undefined, finished: br.world.finished });
+  for (const e of events) {
+    if (e.type === 'decision' && e.decisionId) post({ type: 'decided', branchId: br.info.id, node: br.world.state.decisions[e.decisionId] });
+  }
 }
 
 function sampleAll(br: Branch): void {
@@ -205,108 +358,84 @@ function sampleAll(br: Branch): void {
   }
 }
 
-/** 阶段反思、主角子女继承智能 */
+/** 阶段反思、主角子女继承智能。反思不挡世界，排在决策后面 */
 function afterStep(br: Branch, events: WorldEvent[]): void {
   const level = brainSettings?.level ?? 0;
+  const world = br.world;
   for (const e of events) {
     if (e.type === 'child' && e.relatedIds && level > 0) {
-      const parent = br.world.bot(e.botId!);
-      const child = br.world.bot(e.relatedIds[1]);
+      const parent = world.bot(e.botId!);
+      const child = world.bot(e.relatedIds[1]);
       if (parent?.intelligence === 'llm' && child && child.intelligence !== 'llm') {
-        child.intelligence = 'llm';
-        child.model = parent.model;
-        if (level >= 2 && brain) brain.portrait(br.world, child).then((p) => { child.portrait = p; }).catch(() => undefined);
+        // 继承来的是配角：问模型，但不让世界为他停下
+        world.setIntelligence(child.id, 'llm', parent.model, false);
+        if (level >= 2 && brain) brain.portrait(world, child).then((p) => { child.portrait = p; }).catch(() => undefined);
       }
     }
     if (e.type === 'stage' && level >= 2 && brain) {
-      const bot = br.world.bot(e.botId!);
+      const bot = world.bot(e.botId!);
       if (!bot || bot.intelligence !== 'llm') continue;
       const newStage = (e.data?.stage as LifeStage) ?? bot.stage;
       const idx = STAGE_ORDER.indexOf(newStage);
-      if (idx <= 1) continue; // 婴儿→童年不反思
+      if (idx <= 1) continue;
       const ended = STAGE_ORDER[idx - 1];
-      const world = br.world;
       const tick = e.tick;
       brain.reflect(world, bot, ended).then((r) => {
+        if (br.world !== world) return;
         bot.reflections.push({ stage: ended, tick, text: r.reflection });
         if (r.goal) bot.goal = r.goal;
         post({ type: 'reflection', branchId: br.info.id, botId: bot.id, stage: ended, text: r.reflection });
-      }).catch((err) => post({ type: 'error', message: `反思失败：${String(err)}` }));
+      }).catch((err) => post({ type: 'error', message: `反思失败：${String(err).slice(0, 120)}` }));
     }
   }
 }
 
-async function handlePending(br: Branch): Promise<void> {
-  const pending = [...br.world.pending];
-  const results: Array<{ node: DecisionNode; choice: string; by: 'user' | 'llm' | 'rules'; monologue?: string; model?: string }> = [];
-  // 非用户控制的并行问模型，用户控制的逐个等待
-  const auto = pending.filter((n) => !(userControl === n.botId && br.info.id === activeId));
-  const manual = pending.filter((n) => userControl === n.botId && br.info.id === activeId);
-  for (const n of auto) post({ type: 'pending', branchId: br.info.id, node: n, needsUser: false });
-  for (const n of auto) post({ type: 'thinking', branchId: br.info.id, botId: n.botId, kind: n.kind, on: true });
-  const autoResults = await Promise.all(auto.map(async (node) => {
-    try {
-      if (!brain) throw new Error('未配置模型');
-      const r = await brain.decide(br.world, node);
-      return { node, choice: r.choice, by: 'llm' as const, monologue: r.monologue, model: r.model, goal: r.goal };
-    } catch (err) {
-      post({ type: 'error', message: `模型决策失败，已按规则选择：${String(err)}` });
-      const opt = node.options.reduce((a, b) => ((b.weight ?? 1) > (a.weight ?? 1) ? b : a));
-      return { node, choice: opt.id, by: 'rules' as const, monologue: undefined, model: undefined, goal: undefined };
-    } finally {
-      post({ type: 'thinking', branchId: br.info.id, botId: node.botId, kind: node.kind, on: false });
-    }
-  }));
-  for (const r of autoResults) {
-    if (r.goal) { const b = br.world.bot(r.node.botId); if (b) b.goal = r.goal; }
-    results.push(r);
+// ---------- 回退与分叉 ----------
+
+/** 模拟领先画面时，退回画面所在年份重放，让 botId 之后的决定按新设定重新做 */
+function rewindIfAhead(br: Branch, botId: string): void {
+  const display = displayAt.get(br.info.id) ?? 0;
+  if (br.world.tick <= display + 1) return;
+  const old = br.world;
+  const w = old.rewind(display, botId);
+  // 旧世界里还没回来的请求作废；新世界会按需重新发（能复用的答案已经照搬）
+  abortInflight(br.info.id);
+  // 旁白和反思不在快照里的，从旧世界补回来
+  for (const id of w.state.botOrder) {
+    const o = old.bot(id);
+    const b = w.bot(id);
+    if (o && b && !b.portrait && o.portrait) b.portrait = o.portrait;
   }
-  for (const node of manual) {
-    post({ type: 'pending', branchId: br.info.id, node, needsUser: true });
-    const r = await new Promise<{ choice: string; by: 'user' | 'llm'; monologue?: string; model?: string }>((resolve) => {
-      waitingUser = { branchId: br.info.id, decisionId: node.id, resolve };
-    });
-    results.push({ node, ...r });
-  }
-  // 严格按挂起顺序落地，保证分叉回放一致
-  for (const node of pending) {
-    const r = results.find((x) => x.node.id === node.id)!;
-    br.world.resolveDecision(node.id, r.choice, r.by, r.monologue, r.model);
-    post({ type: 'decided', branchId: br.info.id, node: br.world.state.decisions[node.id] });
-  }
-  // 决策可能引发新的挂起决策（如高考→选专业）
-  if (br.world.pending.length) await handlePending(br);
+  br.world = w;
+  const fromTick = w.tick;
+  for (const [id, arr] of br.samples) br.samples.set(id, arr.filter((s) => s.tick <= fromTick));
+  for (const k of [...userWaits.keys()]) if (k.startsWith(`${br.info.id}:`)) userWaits.delete(k);
+  shownUserKey = undefined;
+  blockedSince.clear();
+  post({ type: 'rewind', branchId: br.info.id, fromSeq: w.state.log.length, fromTick });
+  flush(br, [], true);
 }
 
 function fork(decisionId: string, choice: string): void {
   const parent = branches.get(activeId);
   if (!parent) return;
-  const id = `fork-${branches.size}`;
   const node = parent.world.state.decisions[decisionId];
-  const alt = node?.options.find((o) => o.id === choice);
+  if (!node) return;
+  const id = `fork-${branches.size}`;
+  const alt = node.options.find((o) => o.id === choice);
+  const snapTick = Math.floor(node.tick / 12) * 12;
+  const fromSeq = parent.world.snapshotLogLength(snapTick);
   const child = parent.world.fork(decisionId, choice, id);
   const samples = new Map<string, StatSample[]>();
-  for (const [k, v] of parent.samples) samples.set(k, v.filter((s) => s.tick <= child.tick));
+  for (const [k, v] of parent.samples) samples.set(k, v.filter((s) => s.tick <= snapTick));
   const info: BranchInfo = { id, parentId: parent.info.id, forkedAtTick: node.tick, label: `分叉：${alt?.label ?? choice}` };
   const br: Branch = { info, world: child, samples };
   branches.set(id, br);
-  post({ type: 'branch', branch: info });
-  // 补齐分叉点之前的事件（主线程已有相同前缀，这里只发分叉点所在年的新事件）
-  const snapTick = Math.floor(node.tick / 12) * 12;
-  const prefix = child.state.log.filter((e) => e.tick >= snapTick);
   activeId = id;
-  post({ type: 'tick', branchId: id, summary: child.summary(), events: prefix, bots: allSummaries(child), finished: child.finished });
-  catchUpTarget = parent.world.tick;
-  playing = true;
-  post({ type: 'playing', playing: true });
-  void (async () => {
-    if (child.pending.length) await handlePending(br);
-    void loop();
-  })();
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  displayAt.set(id, displayAt.get(parent.info.id) ?? parent.world.tick);
+  post({ type: 'branch', branch: info, fromSeq });
+  flush(br, child.state.log.slice(fromSeq), true);
+  wake();
 }
 
 export {};

@@ -20,7 +20,10 @@ export type ScriptedChoices = Record<string, ScriptedChoice>;
 export interface StepResult {
   tick: number;
   events: WorldEvent[];
+  /** 本次新提出、还没有答案的决策 */
   pending: DecisionNode[];
+  /** 到期了却还没有答案的决策：世界没有前进，在等它们 */
+  blocked: DecisionNode[];
   finished: boolean;
 }
 
@@ -66,6 +69,7 @@ export class World {
       log: [],
       decisions: {},
       pendingDecisionIds: [],
+      openDecisionIds: [],
       eraState: era.initEraState(),
       nextId: 1,
     };
@@ -78,13 +82,17 @@ export class World {
   static restore(era: EraPack, snapshot: YearSnapshot, log: WorldEvent[], scripted: ScriptedChoices = {}): World {
     const state = JSON.parse(snapshot.json) as WorldStateShape;
     state.log = log.slice(0, snapshot.logLength);
+    state.openDecisionIds ??= [];
     const world = new World(era, state);
     world.scripted = scripted;
     world.snapshots.set(snapshot.tick, snapshot);
-    // 快照时挂起的决策若有脚本，立即解决
+    // 快照时还没有答案的决策，若有脚本就填上
     for (const id of [...state.pendingDecisionIds]) {
       const s = scripted[id];
-      if (s) world.resolveDecision(id, s.choice, s.by, s.monologue, s.model);
+      const n = state.decisions[id];
+      if (s && n && (s.botId ?? n.botId) === n.botId && (s.kind ?? n.kind) === n.kind) {
+        world.resolveDecision(id, s.choice, s.by, s.monologue, s.model);
+      }
     }
     return world;
   }
@@ -157,19 +165,24 @@ export class World {
   // ---------- 推进 ----------
 
   step(): StepResult {
-    if (this.state.pendingDecisionIds.length > 0) {
-      throw new Error('有挂起的决策，先调用 resolveDecision');
-    }
     if (this.finished) {
-      return { tick: this.state.tick, events: [], pending: [], finished: true };
+      return { tick: this.state.tick, events: this.takeEvents(), pending: [], blocked: [], finished: true };
     }
     const t = this.state.tick;
+    // 到期了还没有答案：世界只能等
+    const blocked = this.state.openDecisionIds
+      .map((id) => this.state.decisions[id])
+      .filter((n) => n.dueTick <= t && n.chosen === undefined);
+    if (blocked.length) {
+      return { tick: t, events: this.takeEvents(), pending: this.takePending(), blocked, finished: false };
+    }
     const { year, month } = tickToYearMonth(t, this.state.config.startYear);
     this.ctx.tick = t;
     this.ctx.year = year;
     this.ctx.month = month;
 
     if (month === 1) this.era.onYear(this.ctx);
+    this.applyDue(t);
 
     // 出生在本 tick 的初始人口
     for (const id of this.state.botOrder) {
@@ -199,76 +212,80 @@ export class World {
 
     this.state.tick++;
     if (this.state.tick % TICKS_PER_YEAR === 0) this.takeSnapshot();
-    this.flushScripted();
-    // 两次 step 之间（驱动层解决决策时）产生的事件也会累积在缓冲里，随本次一起交出
-    const events = this.stepEvents;
-    const pending = this.stepPending.filter((n) => n.chosen === undefined);
-    this.stepEvents = [];
-    this.stepPending = [];
-    return { tick: this.state.tick, events, pending, finished: this.finished };
+    return { tick: this.state.tick, events: this.takeEvents(), pending: this.takePending(), blocked: [], finished: this.finished };
   }
 
-  /** 回放时，按挂起顺序解决有脚本的决策。驱动层也必须按 pending 顺序解决，否则回放会分歧 */
-  private flushScripted(): void {
-    let progressed = true;
-    while (progressed) {
-      progressed = false;
-      for (const id of [...this.state.pendingDecisionIds]) {
-        const s = this.scripted[id];
-        if (s) {
-          this.resolveDecision(id, s.choice, s.by, s.monologue, s.model);
-          progressed = true;
-        }
-      }
+  private takeEvents(): WorldEvent[] {
+    const e = this.stepEvents;
+    this.stepEvents = [];
+    return e;
+  }
+
+  private takePending(): DecisionNode[] {
+    const p = this.stepPending.filter((n) => n.chosen === undefined);
+    this.stepPending = [];
+    return p;
+  }
+
+  /** 按提出顺序落地到期的决策；落地时可能连锁提出新的决策 */
+  private applyDue(t: number): void {
+    for (;;) {
+      const due = this.state.openDecisionIds
+        .map((id) => this.state.decisions[id])
+        .filter((n) => n.dueTick <= t && n.chosen !== undefined)
+        .sort((a, b) => seqOf(a.id) - seqOf(b.id));
+      if (!due.length) return;
+      for (const n of due) this.applyDecision(n);
     }
   }
 
-  /** 连续推进直到有挂起决策、到达目标 tick 或结束 */
+  /** 连续推进直到被未答复的决策挡住、到达目标 tick 或结束 */
   run(untilTick?: number): StepResult[] {
     const out: StepResult[] = [];
     const target = untilTick ?? Infinity;
-    while (!this.finished && this.state.tick < target && this.state.pendingDecisionIds.length === 0) {
-      out.push(this.step());
+    while (!this.finished && this.state.tick < target) {
+      const r = this.step();
+      out.push(r);
+      if (r.blocked.length) break;
     }
     return out;
   }
 
   // ---------- 决策 ----------
 
+  /** 给决策一个答案。它在犹豫期结束（dueTick）时才落地 */
   resolveDecision(id: string, choice: string, by: DecisionResolver, monologue?: string, model?: string): void {
     const node = this.state.decisions[id];
     if (!node) throw new Error(`未知决策 ${id}`);
     if (node.chosen !== undefined) return;
-    const bot = this.state.bots[node.botId];
     const opt = node.options.find((o) => o.id === choice) ?? node.options[0];
     node.chosen = opt.id;
     node.resolvedBy = by;
     node.monologue = monologue;
     node.model = model;
     this.state.pendingDecisionIds = this.state.pendingDecisionIds.filter((p) => p !== id);
-    // 以决策发生的 tick 记录，而不是解决时的 tick
-    this.log({
-      type: 'decision', botId: bot.id, importance: 7, decisionId: id, tick: node.tick,
-      text: `${node.situation}${bot.name}选择了「${opt.label}」。`,
-      data: { kind: node.kind, choice: opt.id, by },
-    });
-    const savedTick = this.ctx.tick;
-    const ym = tickToYearMonth(node.tick, this.state.config.startYear);
-    this.ctx.tick = node.tick;
-    this.ctx.year = ym.year;
-    this.ctx.month = ym.month;
-    this.era.decisions[node.kind]?.apply(bot, opt.id, this.ctx);
-    this.ctx.tick = savedTick;
-    const back = tickToYearMonth(savedTick, this.state.config.startYear);
-    this.ctx.year = back.year;
-    this.ctx.month = back.month;
   }
 
-  setIntelligence(botId: string, mode: IntelligenceMode, model?: string): void {
+  private applyDecision(node: DecisionNode): void {
+    node.applied = true;
+    this.state.openDecisionIds = this.state.openDecisionIds.filter((p) => p !== node.id);
+    const bot = this.state.bots[node.botId];
+    if (!bot || bot.deathTick !== undefined) return;
+    const opt = node.options.find((o) => o.id === node.chosen) ?? node.options[0];
+    this.log({
+      type: 'decision', botId: bot.id, importance: 7, decisionId: node.id,
+      text: `${node.situation}${bot.name}选择了「${opt.label}」。`,
+      data: { kind: node.kind, choice: opt.id, by: node.resolvedBy },
+    });
+    this.era.decisions[node.kind]?.apply(bot, opt.id, this.ctx, node);
+  }
+
+  setIntelligence(botId: string, mode: IntelligenceMode, model?: string, lead = mode === 'llm'): void {
     const bot = this.state.bots[botId];
     if (!bot) return;
     bot.intelligence = mode;
     bot.model = model;
+    bot.lead = mode === 'llm' && lead;
   }
 
   // ---------- 分叉 ----------
@@ -286,24 +303,63 @@ export class World {
     const scripted: ScriptedChoices = {};
     for (const d of Object.values(this.state.decisions)) {
       if (d.chosen === undefined || d.resolvedBy === 'rules') continue;
-      if (d.tick < snapTick || d.tick > node.tick) continue;
-      if (d.id === decisionId) continue;
+      if (d.tick > node.tick || d.id === decisionId) continue;
       // 目标 bot 在改选之后的连锁决策属于旧分支的后果，不照搬
       if (d.botId === node.botId && seqOf(d.id) > seqOf(decisionId)) continue;
-      scripted[d.id] = { choice: d.chosen, by: d.resolvedBy!, monologue: d.monologue, model: d.model, botId: d.botId, kind: d.kind };
+      scripted[d.id] = scriptOf(d);
     }
     scripted[decisionId] = { choice: altChoice, by: 'user', monologue: '（分叉：换一条路试试）', botId: node.botId, kind: node.kind };
     const child = World.restore(this.era, snap, this.state.log, scripted);
+    for (const [t, sn] of this.snapshots) if (t < snapTick) child.snapshots.set(t, sn);
     child.state.branchId = branchId;
     child.state.parentBranchId = this.state.branchId;
     child.state.forkedAtTick = node.tick;
-    // 重放到决策所在 tick 结束
+    child.copyIntelligenceFrom(this);
+    // 重放到改选被提出的那个月，之后的世界开始分歧
     while (child.state.tick <= node.tick && !child.finished) {
-      if (child.state.pendingDecisionIds.length > 0) break;
-      child.step();
+      if (child.step().blocked.length) break;
     }
     child.scripted = {};
     return child;
+  }
+
+  /**
+   * 回退到 toTick 所在年的年初重放，用于在画面之后改变某人的设定（赋予智能、由用户掌控）。
+   * toTick 之前发生的决策原样照搬；之后的模型/用户答案尽量复用，exceptBot 之后的决策重新做。
+   */
+  rewind(toTick: number, exceptBot?: string): World {
+    let snapTick = Math.floor(toTick / TICKS_PER_YEAR) * TICKS_PER_YEAR;
+    while (snapTick > 0 && !this.snapshots.has(snapTick)) snapTick -= TICKS_PER_YEAR;
+    const snap = this.snapshots.get(snapTick);
+    if (!snap) throw new Error(`缺少 tick ${snapTick} 的快照`);
+    const scripted: ScriptedChoices = {};
+    for (const d of Object.values(this.state.decisions)) {
+      if (d.chosen === undefined) continue;
+      const history = d.tick < toTick;
+      if (!history && (d.resolvedBy === 'rules' || d.botId === exceptBot)) continue;
+      scripted[d.id] = scriptOf(d);
+    }
+    const w = World.restore(this.era, snap, this.state.log, scripted);
+    for (const [t, sn] of this.snapshots) if (t < snapTick) w.snapshots.set(t, sn);
+    w.state.branchId = this.state.branchId;
+    w.state.parentBranchId = this.state.parentBranchId;
+    w.state.forkedAtTick = this.state.forkedAtTick;
+    w.copyIntelligenceFrom(this);
+    return w;
+  }
+
+  /** 快照里存的是旧的智能设定，换成现在的 */
+  private copyIntelligenceFrom(other: World): void {
+    for (const id of this.state.botOrder) {
+      const o = other.state.bots[id];
+      const b = this.state.bots[id];
+      if (o && b) { b.intelligence = o.intelligence; b.model = o.model; b.lead = o.lead; }
+    }
+  }
+
+  /** 回退时第一个快照所在 tick（日志从这里开始会重新生成） */
+  snapshotLogLength(tick: number): number {
+    return this.snapshots.get(tick)?.logLength ?? 0;
   }
 
   // ---------- 内部 ----------
@@ -328,22 +384,28 @@ export class World {
 
   private requestDecision(bot: Bot, req: DecisionRequest): DecisionNode {
     const id = this.nextId('d');
+    const t = this.state.tick;
+    const delay = Math.max(0, req.deliberation ?? this.era.decisions[req.kind]?.deliberation ?? 1);
     const node: DecisionNode = {
-      id, kind: req.kind, tick: this.state.tick, botId: bot.id,
-      situation: req.situation, options: req.options,
+      id, kind: req.kind, tick: t, dueTick: t + delay, botId: bot.id,
+      situation: req.situation, options: req.options, data: req.data,
     };
     this.state.decisions[id] = node;
     const sc = this.scripted[id];
-    if (sc && (sc.botId ?? bot.id) === bot.id && (sc.kind ?? req.kind) === req.kind) {
-      // 回放：与原始运行一致，等本 tick 结束后再解决（见 flushScripted）
-      this.state.pendingDecisionIds.push(id);
-    } else if (bot.intelligence === 'rules') {
+    const valid = sc && (sc.botId ?? bot.id) === bot.id && (sc.kind ?? req.kind) === req.kind ? sc : undefined;
+    if ((valid && valid.by === 'rules') || (!valid && bot.intelligence === 'rules')) {
+      // 规则决策当场落地；照搬时也要消耗同样的随机数，否则后面的世界会走样
       const opt = this.rng.weighted(req.options, (o) => o.weight ?? 1);
-      this.resolveDecision(id, opt.id, 'rules');
-    } else {
-      this.state.pendingDecisionIds.push(id);
-      this.stepPending.push(node);
+      node.dueTick = t;
+      this.state.openDecisionIds.push(id);
+      this.resolveDecision(id, valid ? valid.choice : opt.id, 'rules');
+      this.applyDecision(node);
+      return node;
     }
+    this.state.openDecisionIds.push(id);
+    this.state.pendingDecisionIds.push(id);
+    if (valid) this.resolveDecision(id, valid.choice, valid.by, valid.monologue, valid.model);
+    else this.stepPending.push(node);
     return node;
   }
 
@@ -365,6 +427,10 @@ export class World {
       alive: () => self.aliveBots(),
       bot: (id) => self.state.bots[id],
       requestDecision: (bot, req) => self.requestDecision(bot, req),
+      openDecision: (botId, kind) => self.state.openDecisionIds.some((id) => {
+        const n = self.state.decisions[id];
+        return n.botId === botId && (!kind || n.kind === kind);
+      }),
       addBot: (bot) => {
         self.state.bots[bot.id] = bot;
         self.state.botOrder.push(bot.id);
@@ -388,6 +454,10 @@ export class World {
       },
     };
   }
+}
+
+function scriptOf(d: DecisionNode): ScriptedChoice {
+  return { choice: d.chosen!, by: d.resolvedBy!, monologue: d.monologue, model: d.model, botId: d.botId, kind: d.kind };
 }
 
 function seqOf(id: string): number {

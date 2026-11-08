@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from 'react';
 import { Application, Container, Graphics, TextStyle } from 'pixi.js';
 import { getEra } from '@lifegame/eras';
 import type { WorldEvent } from '@lifegame/schema';
-import { fmtMoney, useStore, type BotDetail, type BranchData } from '../store.js';
+import { caughtUp, fmtMoney, nowOf, useStore, type BotDetail, type BranchData } from '../store.js';
 import { eduLabel } from '../util.js';
 import { SES_COLOR, SES_LABEL, STAGES, STAGE_COLOR, STAGE_LABEL, TextPool, clamp, css, hashId, hex, stageStarts, stageTable } from './pixi-util.js';
 
@@ -29,6 +29,8 @@ interface Props {
   frameKeys: number[];
 }
 
+const NO_THINKING: Record<string, string> = {};
+
 interface Pt { x: number; y: number; a: number }
 
 export function PeopleView({ branch }: { branch: BranchData }) {
@@ -39,7 +41,7 @@ export function PeopleView({ branch }: { branch: BranchData }) {
 
   const viewTick = useStore((s) => s.viewTick);
   const selected = useStore((s) => s.selectedBot);
-  const thinking = useStore((s) => s.thinking);
+  const thinking = useStore((s) => (caughtUp(s.branches[s.activeBranch]) ? s.thinking : NO_THINKING));
   const detail = useStore((s) => s.botDetail);
   const config = useStore((s) => s.config)!;
   const theme = useStore((s) => s.era?.theme);
@@ -109,7 +111,8 @@ export function PeopleView({ branch }: { branch: BranchData }) {
         const S = styles!;
         const { branch, selected, thinking } = p;
         const bots = branch.bots;
-        const nowTick = branch.summary?.tick ?? 0;
+        const nowTick = nowOf(branch);
+        const simTick = branch.summary?.tick ?? 0;
         const t = Math.min(p.viewTick ?? nowTick, nowTick);
         const year = p.startYear + Math.floor(t / 12);
         const defl = (v: number, y: number) => (wi ? (v * refIdx) / wi(y) : v);
@@ -123,7 +126,7 @@ export function PeopleView({ branch }: { branch: BranchData }) {
 
         // 回看时用历史帧，否则用实时数据
         let wealthOf: (id: string) => number = (id) => bots[id]?.wealth ?? 0;
-        if (p.viewTick !== undefined && p.viewTick < nowTick && p.frameKeys.length) {
+        if (t < simTick && p.frameKeys.length) {
           let lo = 0;
           let hi = p.frameKeys.length - 1;
           while (lo < hi) {
@@ -309,7 +312,7 @@ export function PeopleView({ branch }: { branch: BranchData }) {
       const p = propsRef.current;
       if (id && p) {
         const b = p.branch.bots[id];
-        const nowTick = p.branch.summary?.tick ?? 0;
+        const nowTick = nowOf(p.branch);
         const t = Math.min(p.viewTick ?? nowTick, nowTick);
         const age = Math.floor((Math.min(t, b.deathTick ?? t) - b.birthTick) / 12);
         tip.style.display = 'block';

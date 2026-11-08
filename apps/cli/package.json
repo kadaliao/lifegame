@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "live": "tsx src/live.ts"
   },
   "dependencies": {
     "@lifegame/core": "workspace:*",
@@ -13,5 +14,7 @@
     "@lifegame/llm": "workspace:*",
     "@lifegame/schema": "workspace:*"
   },
-  "devDependencies": { "tsx": "^4.19.2" }
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
 }

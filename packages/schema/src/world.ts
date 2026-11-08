@@ -40,7 +40,10 @@ export interface WorldStateShape {
   botOrder: string[];
   log: WorldEvent[];
   decisions: Record<string, DecisionNode>;
+  /** 还没有答案的决策 */
   pendingDecisionIds: string[];
+  /** 还没落地的决策（含没有答案的） */
+  openDecisionIds: string[];
   /** 时代包的可变全局状态 */
   eraState: Record<string, unknown>;
   nextId: number;

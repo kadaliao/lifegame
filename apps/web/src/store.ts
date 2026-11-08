@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { BotSummary } from '@lifegame/core';
-import { DEFAULT_PROVIDERS, type UsageRecord } from '@lifegame/llm';
+import { DEFAULT_PROVIDERS, type ProviderConfig, type UsageRecord } from '@lifegame/llm';
 import type { Bot, DecisionNode, WorldConfig, WorldEvent, WorldSummary } from '@lifegame/schema';
 import type { BranchInfo, BrainSettings, MainToWorker, StatSample, WorkerToMain } from './protocol.js';
 
@@ -21,6 +21,27 @@ export interface BranchData {
   decided: Record<string, DecisionNode>;
   /** 每年一帧：tick → botId → 净资产，供回看时还原众生相 */
   frames: Record<number, Record<string, number>>;
+  /** 画面播到的 tick。模拟会领先画面几年，用来藏住模型的思考时间 */
+  displayTick: number;
+  /** 回退一次加一，视图据此重建缓存 */
+  epoch: number;
+}
+
+/** 只保留出现在事件里的决策卡片 */
+function decidedIn(events: WorldEvent[], from: Record<string, DecisionNode>): Record<string, DecisionNode> {
+  const out: Record<string, DecisionNode> = {};
+  for (const e of events) if (e.decisionId && from[e.decisionId]) out[e.decisionId] = from[e.decisionId];
+  return out;
+}
+
+/** 画面上的"现在"：不超过模拟实际跑到的位置 */
+export function nowOf(br?: BranchData): number {
+  return br ? Math.min(br.displayTick, br.summary?.tick ?? 0) : 0;
+}
+
+/** 画面是否追上了模拟，正在等某个人想清楚 */
+export function caughtUp(br?: BranchData): boolean {
+  return !!br && br.displayTick >= (br.summary?.tick ?? 0) - 1 && !br.finished;
 }
 
 function frameOf(bots: BotSummary[], tick: number): Record<string, number> {
@@ -60,6 +81,8 @@ interface State {
   botDetail?: BotDetail;
   compareDetail?: BotDetail;
   usage?: UsageRecord;
+  /** 排队和在路上的模型请求 */
+  queue: number;
   errors: string[];
   brain: BrainSettings;
   world: WorldSettings;
@@ -87,13 +110,19 @@ interface State {
 }
 
 const LS_BRAIN = 'lifegame.brain.v1';
+let brainSaved = false;
+/** 画面时钟的小数部分 */
+const displayFloat = new Map<string, number>();
 const LS_WORLD = 'lifegame.world.v1';
 
 function loadBrain(): BrainSettings {
   try {
     const raw = localStorage.getItem(LS_BRAIN);
     if (raw) {
+      brainSaved = true;
       const b = JSON.parse(raw) as BrainSettings;
+      // 本机密钥的服务每次启动重新从开发服务器获取
+      b.providers = b.providers.filter((p) => !p.env);
       // 合并新增的默认 provider
       const ids = new Set(b.providers.map((p) => p.id));
       for (const p of DEFAULT_PROVIDERS) if (!ids.has(p.id)) b.providers.push(p);
@@ -118,6 +147,7 @@ export const useStore = create<State>((set, get) => ({
   speed: 24,
   userControl: null,
   thinking: {},
+  queue: 0,
   errors: [],
   brain: loadBrain(),
   world: loadWorld(),
@@ -129,13 +159,27 @@ export const useStore = create<State>((set, get) => ({
     worker.onmessage = (e: MessageEvent<WorkerToMain>) => onWorkerMessage(e.data, set, get);
     worker.onerror = (e) => set((s) => ({ errors: [...s.errors, `Worker 错误：${e.message}`] }));
     set({ worker });
-    get().restart();
+    startClock(set, get);
+    // 先问开发服务器本机有哪些模型密钥，再开世界
+    loadEnvProviders().then((env) => {
+      if (env.length) {
+        const brain = get().brain;
+        const ids = new Set(env.map((p) => p.id));
+        const providers = [...env, ...brain.providers.filter((p) => !ids.has(p.id) && !p.env)];
+        const stillValid = providers.some((p) => p.models.some((m) => `${p.id}/${m}` === brain.defaultModel));
+        // 没存过设置、存的模型已失效、或者还停在假模型上，都改用本机真模型
+        const defaultModel = !brainSaved || !stillValid || brain.defaultModel.startsWith('mock/') ? `${env[0].id}/${env[0].models[0]}` : brain.defaultModel;
+        set({ brain: { ...brain, providers, defaultModel } });
+      }
+      get().restart();
+    });
   },
 
   send(m) { get().worker?.postMessage(m); },
 
   restart() {
     const { world, brain } = get();
+    displayFloat.clear();
     set({ branches: {}, activeBranch: 'main', compareBranch: undefined, playing: false, viewTick: undefined, selectedBot: undefined, pendingUser: undefined, thinking: {}, botDetail: undefined, compareDetail: undefined, usage: undefined, userControl: null });
     get().send({
       type: 'init',
@@ -145,9 +189,9 @@ export const useStore = create<State>((set, get) => ({
     });
   },
 
-  play() { get().send({ type: 'play' }); set({ viewTick: undefined }); },
-  pause() { get().send({ type: 'pause' }); },
-  setSpeed(s) { set({ speed: s }); get().send({ type: 'speed', ticksPerSecond: s }); },
+  play() { set({ playing: true, viewTick: undefined }); },
+  pause() { set({ playing: false }); },
+  setSpeed(s) { set({ speed: s }); },
   setViewTick(t) { set({ viewTick: t }); },
 
   selectBot(id) {
@@ -193,6 +237,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setBrain(b) {
+    brainSaved = true;
     localStorage.setItem(LS_BRAIN, JSON.stringify(b));
     set({ brain: b });
     get().send({ type: 'setBrain', brain: b });
@@ -218,7 +263,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       for (const b of m.bots) bots[b.id] = b;
       set({
         config: m.config, era: m.era,
-        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: { 0: frameOf(m.bots, 0) } } },
+        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: { 0: frameOf(m.bots, 0) }, displayTick: 0, epoch: 0 } },
         activeBranch: m.branch.id,
       });
       const hero = m.bots.find((b) => b.intelligence === 'llm') ?? m.bots[0];
@@ -251,7 +296,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
     }
     case 'pending': {
       if (m.needsUser) {
-        set({ pendingUser: { branchId: m.branchId, node: m.node }, playing: false });
+        set({ pendingUser: { branchId: m.branchId, node: m.node } });
         if (get().selectedBot !== m.node.botId) get().selectBot(m.node.botId);
       }
       break;
@@ -287,13 +332,12 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       set((s) => {
         const parent = m.branch.parentId ? s.branches[m.branch.parentId] : undefined;
         const snapTick = Math.floor((m.branch.forkedAtTick ?? 0) / 12) * 12;
-        const events = parent ? parent.events.filter((e) => e.tick < snapTick) : [];
-        const decided: Record<string, DecisionNode> = {};
-        if (parent) for (const d of Object.values(parent.decided)) if (d.tick < snapTick) decided[d.id] = d;
+        const events = parent ? parent.events.filter((e) => e.seq < m.fromSeq) : [];
+        const decided = parent ? decidedIn(events, parent.decided) : {};
         const frames: Record<number, Record<string, number>> = {};
         if (parent) for (const [k, f] of Object.entries(parent.frames)) if (Number(k) <= snapTick) frames[Number(k)] = f;
         return {
-          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames } },
+          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: parent?.displayTick ?? 0, epoch: 0 } },
           activeBranch: m.branch.id,
           compareBranch: m.branch.parentId,
           viewTick: undefined,
@@ -308,9 +352,68 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       }
       break;
     }
-    case 'usage': set({ usage: m.usage }); break;
-    case 'playing': set({ playing: m.playing }); break;
+    case 'rewind': {
+      set((s) => {
+        const br = s.branches[m.branchId];
+        if (!br) return {};
+        const events = br.events.filter((e) => e.seq < m.fromSeq);
+        const frames: Record<number, Record<string, number>> = {};
+        for (const [k, f] of Object.entries(br.frames)) if (Number(k) <= m.fromTick) frames[Number(k)] = f;
+        const pendingUser = s.pendingUser?.branchId === m.branchId ? undefined : s.pendingUser;
+        return { pendingUser, branches: { ...s.branches, [m.branchId]: { ...br, events, decided: decidedIn(events, br.decided), frames, epoch: br.epoch + 1 } } };
+      });
+      break;
+    }
+    case 'usage': set({ usage: m.usage, queue: m.queue }); break;
     case 'error': set((s) => ({ errors: [...s.errors.slice(-4), m.message] })); break;
+  }
+}
+
+/** 画面时钟：按播放速度推进 displayTick，不超过模拟；并把位置告诉 Worker，好让模拟保持领先 */
+function startClock(set: Set, get: Get): void {
+  let last = performance.now();
+  let lastPost = 0;
+  const frame = (now: number) => {
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    const s = get();
+    const br = s.branches[s.activeBranch];
+    if (br) {
+      const sim = br.summary?.tick ?? 0;
+      let cur = displayFloat.get(br.info.id) ?? br.displayTick;
+      if (s.playing) {
+        cur = Number.isFinite(s.speed) ? Math.min(sim, cur + s.speed * dt) : sim;
+        displayFloat.set(br.info.id, cur);
+        const ti = Math.floor(cur);
+        if (ti !== br.displayTick) {
+          set((st) => ({ branches: { ...st.branches, [br.info.id]: { ...st.branches[br.info.id], displayTick: ti } } }));
+        }
+        if (br.finished && ti >= sim) set({ playing: false });
+      }
+      if (now - lastPost > 120) {
+        lastPost = now;
+        // 领先量约等于 12 秒的播放，够藏住主角连着三四次的思考。
+        // 中途改设定会触发回退重放，所以领先多一些没有副作用
+        const ahead = Number.isFinite(s.speed) ? Math.max(60, Math.min(600, Math.round(s.speed * 12))) : 240;
+        s.send({ type: 'display', branchId: br.info.id, tick: Math.floor(cur), ahead });
+      }
+    }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+async function loadEnvProviders(): Promise<ProviderConfig[]> {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    const res = await fetch('/llm/env', { signal: ctl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    const data = await res.json() as { providers: Array<{ id: string; label: string; baseUrl: string; models: string[] }> };
+    return data.providers.filter((p) => p.models.length).map((p) => ({ id: p.id, label: p.label, kind: 'openai-compatible' as const, baseUrl: p.baseUrl, models: p.models, env: true }));
+  } catch {
+    return [];
   }
 }
 
@@ -328,3 +431,6 @@ export function fmtMoney(n: number): string {
   if (a >= 1e4) return `${(n / 1e4).toFixed(1)}万`;
   return `${Math.round(n)}`;
 }
+
+// 开发时便于在控制台检查状态
+if (import.meta.env.DEV) (globalThis as unknown as { __lifegame: typeof useStore }).__lifegame = useStore;

@@ -57,11 +57,12 @@ export function Settings() {
             </label>
           </div>
           <h3>模型服务</h3>
-          <p className="muted small">密钥只存在本机浏览器 localStorage，直接从浏览器调用接口。Ollama 需设置 <code>OLLAMA_ORIGINS=*</code>。</p>
+          <p className="muted small">标着"本机密钥"的服务，密钥留在开发服务器的环境变量里，浏览器拿不到。其余服务的密钥存在本机浏览器 localStorage，直接从浏览器调用。Ollama 需设置 <code>OLLAMA_ORIGINS=*</code>。</p>
           {b.providers.map((p, i) => (
             <div key={p.id} className="provider">
               <b>{p.label ?? p.id}</b>
-              {p.kind !== 'mock' && (
+              {p.env && <span className="muted small provider-env">密钥来自本机环境变量，经开发服务器代理 · 可用模型：{p.models.join('、')}</span>}
+              {p.kind !== 'mock' && !p.env && (
                 <>
                   <input placeholder="Base URL" value={p.baseUrl ?? ''} onChange={(e) => updateProvider(i, { baseUrl: e.target.value })} />
                   <input placeholder="API Key" type="password" value={p.apiKey ?? ''} onChange={(e) => updateProvider(i, { apiKey: e.target.value })} />

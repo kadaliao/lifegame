@@ -1,11 +1,13 @@
 import { useMemo, useState } from 'react';
-import { useStore, type BranchData } from '../store.js';
+import { caughtUp, nowOf, useStore, type BranchData } from '../store.js';
 import { avatarColor } from '../views/LifeScroll.js';
+
+const NO_THINKING: Record<string, string> = {};
 
 export function Sidebar({ branch }: { branch: BranchData }) {
   const selected = useStore((s) => s.selectedBot);
   const selectBot = useStore((s) => s.selectBot);
-  const thinking = useStore((s) => s.thinking);
+  const thinking = useStore((s) => (caughtUp(s.branches[s.activeBranch]) ? s.thinking : NO_THINKING));
   const branches = useStore((s) => s.branches);
   const active = useStore((s) => s.activeBranch);
   const compare = useStore((s) => s.compareBranch);
@@ -13,9 +15,11 @@ export function Sidebar({ branch }: { branch: BranchData }) {
   const setCompare = useStore((s) => s.setCompareBranch);
   const startYear = useStore((s) => s.config?.startYear ?? 1980);
   const [q, setQ] = useState('');
-  const tick = branch.summary?.tick ?? 0;
+  const viewTick = useStore((s) => s.viewTick);
+  const now = nowOf(branch);
+  const tick = Math.min(viewTick ?? now, now);
 
-  const heroes = useMemo(() => branch.botOrder.map((id) => branch.bots[id]).filter((b) => b.intelligence === 'llm'), [branch]);
+  const heroes = useMemo(() => branch.botOrder.map((id) => branch.bots[id]).filter((b) => b.intelligence === 'llm' && (b.generation === 0 || b.birthTick <= tick)), [branch, tick]);
   const others = useMemo(() => {
     if (!q) return [];
     return branch.botOrder.map((id) => branch.bots[id]).filter((b) => b.name.includes(q) || (b.jobTitle ?? '').includes(q) || b.city.includes(q)).slice(0, 30);

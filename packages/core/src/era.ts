@@ -9,6 +9,10 @@ export interface DecisionRequest {
   kind: string;
   situation: string;
   options: DecisionOption[];
+  /** 附带数据，落地时原样交给 apply */
+  data?: Record<string, unknown>;
+  /** 覆盖默认的犹豫期（月） */
+  deliberation?: number;
 }
 
 /** 时代包在每个钩子里拿到的上下文 */
@@ -22,8 +26,10 @@ export interface EraContext {
   log(e: LogInput): WorldEvent;
   alive(): Bot[];
   bot(id: string): Bot | undefined;
-  /** 请求一个决策。规则 bot 立即解决并返回已决节点；智能 bot 返回挂起节点 */
+  /** 请求一个决策。规则 bot 立即落地；智能 bot 进入犹豫期，到期生效 */
   requestDecision(bot: Bot, req: DecisionRequest): DecisionNode;
+  /** 这个人是否有还没落地的决策（可限定类型） */
+  openDecision(botId: string, kind?: string): boolean;
   /** 新生儿进入世界 */
   addBot(bot: Bot): Bot;
   nextId(prefix: string): string;
@@ -32,8 +38,10 @@ export interface EraContext {
 
 export interface DecisionDef {
   kind: string;
+  /** 智能角色的犹豫期（月）：请求发出后世界继续运转，到期才生效。默认 1 */
+  deliberation?: number;
   /** 把选项效果落到世界上 */
-  apply(bot: Bot, optionId: string, ctx: EraContext): void;
+  apply(bot: Bot, optionId: string, ctx: EraContext, node: DecisionNode): void;
 }
 
 export interface EraTheme {

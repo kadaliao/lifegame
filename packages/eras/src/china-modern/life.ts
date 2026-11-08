@@ -191,7 +191,8 @@ export function onBirthday(bot: Bot, age: number, ctx: EraContext): void {
     if (ctx.tick - since >= 6 || age === 16) {
       if (bot.state.location === 'rural' && age <= 45 && ctx.year >= 1985 && rng.chance(ctx.year < 2015 ? 0.5 : 0.3)) {
         moveTo(bot, rng.chance(0.5) ? 'metro' : 'city', ctx, '外出打工');
-        giveJob(bot, JOBS.find((j) => j.id === (ctx.year < 2015 ? 'migrant' : rng.chance(0.5) ? 'migrant' : 'rider'))!, ctx);
+        const jobId = ctx.year < 2015 || rng.chance(0.5) ? 'migrant' : 'rider';
+        giveJob(bot, JOBS.find((j) => j.id === jobId)!, ctx);
       } else {
         const job = pickJob(bot, ctx);
         if (job && rng.chance(0.75 * m.hiring)) giveJob(bot, job, ctx);
@@ -530,8 +531,10 @@ function marriageMarket(bot: Bot, age: number, ctx: EraContext): void {
   if (!rng.chance(p)) return;
 
   const t = ctx.tick;
+  if (ctx.openDecision(bot.id, 'marry')) return;
   const cands = ctx.alive().filter((c) => {
     if (c.sex === bot.sex || c.spouseId || c.familyId === bot.familyId || c.id === bot.id) return false;
+    if (ctx.openDecision(c.id, 'marry')) return false;
     if (hasTag(c, 'student')) return false;
     const ca = Math.floor((t - c.birthTick) / 12);
     const cmin = c.sex === 'male' ? 23 : 21;
@@ -557,19 +560,23 @@ function marriageMarket(bot: Bot, age: number, ctx: EraContext): void {
     if (sc > bestScore) { bestScore = sc; best = c; }
   }
   if (!best || bestScore < 35) return;
-  const partner = best;
-  const intro = partner.state.city === bot.state.city ? (rng.chance(0.5) ? '经人介绍' : '在朋友聚会上') : '经老家亲戚介绍';
-  const pDesc = `${partner.name}，${Math.floor((t - partner.birthTick) / 12)}岁，${partner.state.job?.title ?? '暂无工作'}，${EDU_LABEL[partner.state.education]}，${['赤贫', '贫寒', '普通', '小康', '富裕'][partner.origin.ses - 1]}家庭${partner.state.city === bot.state.city ? '' : `，人在${partner.state.city}`}。`;
-  const pressure = age > peak + 2 ? 1.6 : 1;
+  // 双方有一个是智能人格时，由他/她来拿主意，不让规则角色替主角做决定
+  const me = bot.intelligence !== 'llm' && best.intelligence === 'llm' ? best : bot;
+  const other = me === bot ? best : bot;
+  const meAge = ctx.age(me);
+  const mePeak = me.sex === 'male' ? 28 : 26;
+  const intro = other.state.city === me.state.city ? (rng.chance(0.5) ? '经人介绍' : '在朋友聚会上') : '经老家亲戚介绍';
+  const pDesc = `${other.name}，${ctx.age(other)}岁，${other.state.job?.title ?? '暂无工作'}，${EDU_LABEL[other.state.education]}，${['赤贫', '贫寒', '普通', '小康', '富裕'][other.origin.ses - 1]}家庭${other.state.city === me.state.city ? '' : `，人在${other.state.city}`}。`;
+  const pressure = meAge > mePeak + 2 ? 1.6 : 1;
   const options: DecisionOption[] = [
-    opt('marry', '结婚', '两个人搭伙过日子，也让父母安心。', 2.5 * (bot.values.family / 50) * pressure * (bestScore / 50)),
-    opt('wait', '再等等，还没准备好', ctx.year > 2010 ? '身边不少人都晚婚甚至不婚。' : '父母会催，但人生是自己的。', 1.0 * (bot.values.adventure / 50) * (ctx.year > 2010 ? 1.4 : 0.7)),
+    opt('marry', '结婚', '两个人搭伙过日子，也让父母安心。', 2.5 * (me.values.family / 50) * pressure * (bestScore / 50)),
+    opt('wait', '再等等，还没准备好', ctx.year > 2010 ? '身边不少人都晚婚甚至不婚。' : '父母会催，但人生是自己的。', 1.0 * (me.values.adventure / 50) * (ctx.year > 2010 ? 1.4 : 0.7)),
   ];
-  if (ctx.year >= 2005 && age >= 30) options.push(opt('single', '决定不婚', '一个人也能过得很好。', 0.3 * (bot.values.adventure / 50) * (100 - bot.values.family) / 50));
-  bot.state.vars.proposalTo = Number(partner.id.slice(1));
-  ctx.requestDecision(bot, {
+  if (ctx.year >= 2005 && meAge >= 30) options.push(opt('single', '决定不婚', '一个人也能过得很好。', 0.3 * (me.values.adventure / 50) * (100 - me.values.family) / 50));
+  ctx.requestDecision(me, {
     kind: 'marry',
-    situation: `${ctx.year}年，${age}岁的${bot.name}${intro}认识了${pDesc}两人处得不错，到了谈婚论嫁的时候。`,
+    data: { partnerId: other.id },
+    situation: `${ctx.year}年，${meAge}岁的${me.name}${intro}认识了${pDesc}两人处得不错，到了谈婚论嫁的时候。`,
     options,
   });
 }
@@ -612,6 +619,7 @@ function allowedChildren(ctx: EraContext, bot: Bot): number {
 function fertility(bot: Bot, age: number, ctx: EraContext): void {
   const rng = ctx.rng;
   if (bot.state.vars.dueTick) return;
+  if (ctx.openDecision(bot.id, 'have_child') || (bot.spouseId && ctx.openDecision(bot.spouseId, 'have_child'))) return;
   const n = bot.childrenIds.length;
   const allowed = allowedChildren(ctx, bot);
   if (n >= allowed) return;
@@ -620,6 +628,9 @@ function fertility(bot: Bot, age: number, ctx: EraContext): void {
   const spouse = ctx.bot(bot.spouseId!);
   if (!spouse || spouse.deathTick !== undefined) return;
   const yearsMarried = (ctx.tick - (bot.relationships.find((r) => r.kind === 'spouse')?.sinceTick ?? ctx.tick)) / 12;
+  // 夫妻里有智能人格的，由他/她来拿主意
+  const decider = bot.intelligence !== 'llm' && spouse.intelligence === 'llm' ? spouse : bot;
+  const partner = decider === bot ? spouse : bot;
   let p = n === 0 ? (yearsMarried < 1 ? 0.35 : 0.5) : 0.25;
   if (ctx.year > 2015) p *= 0.7;
   if (age > 36) p *= 0.5;
@@ -630,9 +641,10 @@ function fertility(bot: Bot, age: number, ctx: EraContext): void {
     opt('later', '过两年再说', '先把日子过稳，房子、工作都还没着落。', 1.0 * (netWorth(bot) < 0 ? 2 : 1) * (ctx.year > 2010 ? 1.4 : 0.8)),
   ];
   if (ctx.year >= 2005 && n === 0) options.push(opt('dink', '不要孩子', '两个人的生活也很好。', 0.25 * (bot.values.adventure / 50) * ((100 - bot.values.family) / 50) * (bot.state.location === 'metro' ? 1.8 : 0.6)));
-  ctx.requestDecision(bot, {
+  const wifeNote = decider === bot ? '' : `妻子${bot.name}${age}岁。`;
+  ctx.requestDecision(decider, {
     kind: 'have_child',
-    situation: `${ctx.year}年，${bot.name}${age}岁，和${spouse.name}结婚${Math.max(1, Math.round(yearsMarried))}年了。`,
+    situation: `${ctx.year}年，${decider.name}${ctx.age(decider)}岁，和${partner.name}结婚${Math.max(1, Math.round(yearsMarried))}年了。${wifeNote}`,
     options,
   });
 }
@@ -644,6 +656,7 @@ function housing(bot: Bot, ctx: EraContext): void {
     if (sp?.state.ownsHome) { bot.state.ownsHome = true; return; }
   }
   if (bot.state.vars.homeDeclinedAt && ctx.tick - bot.state.vars.homeDeclinedAt < 36) return;
+  if (ctx.openDecision(bot.id, 'buy_home') || (bot.spouseId && ctx.openDecision(bot.spouseId, 'buy_home'))) return;
   const area = bot.state.location === 'metro' ? 75 : 95;
   const price = housePrice(bot.state.location, ctx.year) * area;
   if (price <= 0) return;
@@ -667,10 +680,9 @@ function housing(bot: Bot, ctx: EraContext): void {
   if (bot.state.location !== homeRegion(bot) && homePrice < price * 0.5) {
     options.push(opt('hometown', '回老家买一套', `老家总价只要${money(homePrice)}，全款都够，但人还在外面漂。`, 0.8 * (bot.values.family / 50) * (bot.values.tradition / 50)));
   }
-  bot.state.vars.homeOffer = price;
-  bot.state.vars.homeOfferHome = homePrice;
   ctx.requestDecision(bot, {
     kind: 'buy_home',
+    data: { price, homePrice },
     situation: `${ctx.year}年，${bot.name}手里攒了${money(bot.state.wealth)}，中介打来电话。`,
     options,
   });
@@ -919,6 +931,7 @@ export const decisions: Record<string, DecisionDef> = {
   },
   career: {
     kind: 'career',
+    deliberation: 2,
     apply(bot, choice, ctx) {
       switch (choice) {
         case 'metro': {
@@ -978,6 +991,7 @@ export const decisions: Record<string, DecisionDef> = {
   },
   laid_off: {
     kind: 'laid_off',
+    deliberation: 2,
     apply(bot, choice, ctx) {
       switch (choice) {
         case 'same': { const job = pickJob(bot, ctx); if (job && ctx.rng.chance(0.7 * es(ctx).modifiers.hiring)) giveJob(bot, job, ctx); break; }
@@ -996,9 +1010,9 @@ export const decisions: Record<string, DecisionDef> = {
   },
   marry: {
     kind: 'marry',
-    apply(bot, choice, ctx) {
-      const partner = ctx.bot(`b${bot.state.vars.proposalTo}`);
-      delete bot.state.vars.proposalTo;
+    deliberation: 3,
+    apply(bot, choice, ctx, node) {
+      const partner = ctx.bot(String(node.data?.partnerId ?? ''));
       if (choice === 'marry' && partner) doMarry(bot, partner, ctx);
       else if (choice === 'single') { tag(bot, 'single'); ctx.log({ type: 'love', botId: bot.id, importance: 6, text: `${bot.name}决定不结婚了，一个人过。` }); }
       else if (partner) ctx.log({ type: 'love', botId: bot.id, importance: 4, text: `${bot.name}和${partner.name}的事最后没了下文。` });
@@ -1006,18 +1020,20 @@ export const decisions: Record<string, DecisionDef> = {
   },
   have_child: {
     kind: 'have_child',
+    deliberation: 2,
     apply(bot, choice, ctx) {
-      if (choice === 'yes') bot.state.vars.dueTick = ctx.tick + 10;
+      const mother = bot.sex === 'female' ? bot : ctx.bot(bot.spouseId ?? '');
+      if (choice === 'yes' && mother) mother.state.vars.dueTick = ctx.tick + 10;
       else if (choice === 'dink') { tag(bot, 'dink'); const sp = ctx.bot(bot.spouseId ?? ''); if (sp) tag(sp, 'dink'); ctx.log({ type: 'child', botId: bot.id, importance: 6, text: `${bot.name}夫妻俩决定做丁克。` }); }
     },
   },
   buy_home: {
     kind: 'buy_home',
-    apply(bot, choice, ctx) {
-      const price = bot.state.vars.homeOffer ?? 0;
-      const homePrice = bot.state.vars.homeOfferHome ?? 0;
-      delete bot.state.vars.homeOffer;
-      delete bot.state.vars.homeOfferHome;
+    deliberation: 2,
+    apply(bot, choice, ctx, node) {
+      if (bot.state.ownsHome) return; // 犹豫期里配偶已经买了
+      const price = Number(node.data?.price ?? 0);
+      const homePrice = Number(node.data?.homePrice ?? 0);
       if (choice === 'buy') buyHome(bot, price, bot.state.location, ctx);
       else if (choice === 'hometown') buyHome(bot, homePrice, homeRegion(bot), ctx);
       else bot.state.vars.homeDeclinedAt = ctx.tick;

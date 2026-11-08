@@ -23,6 +23,7 @@ export interface BotSummary {
   region: Bot['origin']['region'];
   intelligence: Bot['intelligence'];
   model?: string;
+  lead?: boolean;
   portrait?: string;
 }
 
@@ -33,6 +34,6 @@ export function summarize(b: Bot): BotSummary {
     generation: b.generation, stage: b.stage,
     health: Math.round(b.state.health), happiness: Math.round(b.state.happiness), wealth: Math.round(b.state.wealth),
     education: b.state.education, jobTitle: b.state.job?.title, city: b.state.city,
-    ses: b.origin.ses, region: b.origin.region, intelligence: b.intelligence, model: b.model, portrait: b.portrait,
+    ses: b.origin.ses, region: b.origin.region, intelligence: b.intelligence, model: b.model, lead: b.lead, portrait: b.portrait,
   };
 }

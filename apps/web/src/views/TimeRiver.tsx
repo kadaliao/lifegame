@@ -3,9 +3,11 @@ import { Application, Container, Graphics, TextStyle } from 'pixi.js';
 import type { BotSummary } from '@lifegame/core';
 import { getEra } from '@lifegame/eras';
 import type { WorldEvent } from '@lifegame/schema';
-import { useStore, type BranchData } from '../store.js';
+import { caughtUp, nowOf, useStore, type BranchData } from '../store.js';
 import { eduLabel } from '../util.js';
 import { STAGES, STAGE_COLOR, STAGE_LABEL, TextPool, clamp, css, hex, stageStarts, stageTable } from './pixi-util.js';
+
+const NO_THINKING: Record<string, string> = {};
 
 // ---------- 版面常量 ----------
 const RULER_H = 24;
@@ -25,6 +27,7 @@ const MARKER_SKIP = new Set(['marriage', 'child', 'birth', 'stage', 'death', 'mo
 // ---------- 事件索引（增量） ----------
 interface Index {
   branchId: string;
+  epoch: number;
   len: number;
   byBot: Map<string, WorldEvent[]>;
   marriages: Map<string, Array<{ id: string; tick: number }>>;
@@ -32,8 +35,8 @@ interface Index {
 }
 
 function updateIndex(idx: Index | undefined, branch: BranchData): Index {
-  if (!idx || idx.branchId !== branch.info.id || branch.events.length < idx.len) {
-    idx = { branchId: branch.info.id, len: 0, byBot: new Map(), marriages: new Map(), world: [] };
+  if (!idx || idx.branchId !== branch.info.id || idx.epoch !== branch.epoch || branch.events.length < idx.len) {
+    idx = { branchId: branch.info.id, epoch: branch.epoch, len: 0, byBot: new Map(), marriages: new Map(), world: [] };
   }
   const evs = branch.events;
   for (let i = idx.len; i < evs.length; i++) {
@@ -121,7 +124,9 @@ function buildLayout(bots: Record<string, BotSummary>, order: string[], idx: Ind
   };
   // 已经出现在别家块里的主角（如外孙）不再另开一块
   for (const id of order) {
-    if (bots[id]?.intelligence === 'llm' && !visited.has(id)) addGroup(id, false);
+    const b = bots[id];
+    // 模拟跑在画面前面，还没在画面上出生的后代先不算
+    if (b?.intelligence === 'llm' && !visited.has(id) && (b.generation === 0 || b.birthTick <= shown)) addGroup(id, false);
   }
   if (selected && bots[selected] && !visited.has(selected)) addGroup(selected, true);
 
@@ -275,7 +280,7 @@ export function TimeRiver({ branch }: { branch: BranchData }) {
   const viewTick = useStore((s) => s.viewTick);
   const playing = useStore((s) => s.playing);
   const selected = useStore((s) => s.selectedBot);
-  const thinking = useStore((s) => s.thinking);
+  const thinking = useStore((s) => (caughtUp(s.branches[s.activeBranch]) ? s.thinking : NO_THINKING));
   const config = useStore((s) => s.config)!;
   const theme = useStore((s) => s.era?.theme);
   const selectBot = useStore((s) => s.selectBot);
@@ -510,7 +515,7 @@ function draw(rt: Runtime, p: Props): void {
   if (!rt.styles || rt.styles.key !== `${p.ink}-${p.accent}`) rt.styles = makeStyles(p.ink, p.accent);
   const S = rt.styles;
 
-  const nowTick = branch.summary?.tick ?? 0;
+  const nowTick = nowOf(branch);
   const shown = Math.min(p.viewTick ?? nowTick, nowTick);
   const maxTick = (p.endYear - p.startYear) * 12;
 
@@ -544,7 +549,7 @@ function draw(rt: Runtime, p: Props): void {
   }
 
   // 人群之河数据（缓存）
-  const streamKey = `${branch.info.id}|${branch.botOrder.length}|${Math.floor(shown / STEP)}|${idx.len}`;
+  const streamKey = `${branch.info.id}|${branch.epoch}|${branch.botOrder.length}|${Math.floor(shown / STEP)}|${idx.len}`;
   if (!rt.streamData || rt.streamData.key !== streamKey) rt.streamData = { key: streamKey, ...computeStream(bots, branch.botOrder, shown, table) };
   const stream = rt.streamData;
 

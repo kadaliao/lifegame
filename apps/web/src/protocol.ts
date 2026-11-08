@@ -20,9 +20,7 @@ export interface StatSample {
 
 export type MainToWorker =
   | { type: 'init'; config: WorldConfig; brain: BrainSettings; heroCount: number }
-  | { type: 'play' }
-  | { type: 'pause' }
-  | { type: 'speed'; ticksPerSecond: number }
+  | { type: 'display'; branchId: string; tick: number; ahead: number }
   | { type: 'setIntelligence'; botId: string; mode: 'rules' | 'llm'; model?: string }
   | { type: 'setUserControl'; botId: string | null }
   | { type: 'resolve'; branchId: string; decisionId: string; choice: string }
@@ -47,7 +45,7 @@ export type WorkerToMain =
   | { type: 'thinking'; branchId: string; botId: string; kind: string; on: boolean }
   | { type: 'reflection'; branchId: string; botId: string; stage: string; text: string }
   | { type: 'bot'; branchId: string; bot: Bot; samples: StatSample[]; decisions: DecisionNode[] }
-  | { type: 'branch'; branch: BranchInfo }
-  | { type: 'usage'; usage: UsageRecord }
-  | { type: 'playing'; playing: boolean }
+  | { type: 'branch'; branch: BranchInfo; fromSeq: number }
+  | { type: 'rewind'; branchId: string; fromSeq: number; fromTick: number }
+  | { type: 'usage'; usage: UsageRecord; queue: number }
   | { type: 'error'; message: string };

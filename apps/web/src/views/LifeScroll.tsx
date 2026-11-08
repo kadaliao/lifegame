@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { stageName } from '@lifegame/core';
 import type { DecisionNode, LifeStage, WorldEvent } from '@lifegame/schema';
-import { fmtMoney, useStore, type BotDetail, type BranchData } from '../store.js';
+import { fmtMoney, nowOf, useStore, type BotDetail, type BranchData } from '../store.js';
 import { eduLabel } from '../util.js';
 
 const STAGES: LifeStage[] = ['infant', 'child', 'teen', 'youth', 'adult', 'middle', 'senior'];
@@ -12,7 +12,8 @@ export function LifeScroll({ detail, branch, compact, highlightAfter }: { detail
   const viewTick = useStore((s) => s.viewTick);
   const selected = useStore((s) => s.selectedBot);
   const summary = selected ? branch.bots[selected] : undefined;
-  const shownTick = viewTick ?? branch.summary?.tick ?? 0;
+  const nowTick = nowOf(branch);
+  const shownTick = Math.min(viewTick ?? nowTick, nowTick);
 
   const events = useMemo(() => {
     if (!selected) return [];
@@ -40,7 +41,7 @@ export function LifeScroll({ detail, branch, compact, highlightAfter }: { detail
       <header className="scroll-head">
         <div className="avatar" style={{ background: avatarColor(summary.id) }}>{summary.name.slice(-1)}</div>
         <div>
-          <h2>{summary.name} {summary.intelligence === 'llm' && <span className="hero-tag">✦ {summary.model?.split('/').pop() ?? '智能'}</span>}</h2>
+          <h2>{summary.name} {summary.intelligence === 'llm' && <span className={`hero-tag ${summary.lead ? '' : 'support'}`} title={summary.lead ? '主角：由模型拍板，必要时世界会等他' : '配角：问模型，但来不及时凭直觉，不让世界等'}>{summary.lead ? '✦ 主角' : '✧ 配角'} · {summary.model?.split('/').pop() ?? '智能'}</span>}</h2>
           <div className="muted">
             {summary.sex === 'male' ? '男' : '女'} · {birthYear}年生 · {summary.deathTick !== undefined && summary.deathTick <= shownTick ? `享年${Math.floor((summary.deathTick - summary.birthTick) / 12)}岁` : `${age}岁`} · {summary.city}
           </div>
@@ -94,7 +95,7 @@ function EventRow({ e, birthTick, startYear, decision, dim, branchId }: { e: Wor
         <span className="when">{year} · {age}岁</span>
         <div>
           <div className="situation">{decision.situation}</div>
-          <div className="chosen">→ {chosen?.label ?? decision.chosen}<span className="by">{decision.resolvedBy === 'llm' ? '模型' : decision.resolvedBy === 'user' ? '你' : '规则'}</span></div>
+          <div className="chosen">→ {chosen?.label ?? decision.chosen}<span className="by">{decision.resolvedBy === 'llm' ? '模型' : decision.resolvedBy === 'user' ? '你' : decision.resolvedBy === 'auto' ? '凭直觉' : '规则'}</span></div>
           {decision.monologue && <blockquote className="monologue">{decision.monologue}</blockquote>}
           {decision.options.length > 1 && <button className="link" onClick={() => setOpen(!open)}>{open ? '收起' : `如果当时选了别的…（${decision.options.length - 1} 条路）`}</button>}
           {open && (

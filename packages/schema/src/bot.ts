@@ -118,6 +118,8 @@ export interface Bot {
   stage: LifeStage;
   intelligence: IntelligenceMode;
   model?: string;
+  /** 主角：由模型真正拍板，必要时世界停下来等他。配角（如继承了智能的子女）不让世界等 */
+  lead?: boolean;
   memory: MemoryEntry[];
   reflections: Reflection[];
   goal?: string;

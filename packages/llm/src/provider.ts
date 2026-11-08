@@ -22,9 +22,24 @@ export interface CompleteResult {
   model: string;
 }
 
+/** 带 HTTP 状态的错误，调度器据此决定是否重试 */
+export class LlmHttpError extends Error {
+  constructor(message: string, readonly status: number, readonly retryAfterMs?: number) {
+    super(message);
+  }
+}
+
 export interface Provider {
   id: string;
   complete(req: CompleteRequest, signal?: AbortSignal): Promise<CompleteResult>;
+}
+
+/** 单次请求的超时；超时按临时错误处理，由调度器重试 */
+export const REQUEST_TIMEOUT_MS = 45_000;
+
+function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  const t = AbortSignal.timeout(ms);
+  return signal ? AbortSignal.any([signal, t]) : t;
 }
 
 export interface ProviderConfig {
@@ -35,6 +50,8 @@ export interface ProviderConfig {
   apiKey?: string;
   /** 可选模型列表，供界面下拉 */
   models: string[];
+  /** 密钥来自开发服务器的环境变量，浏览器经本地代理访问 */
+  env?: boolean;
 }
 
 /** OpenAI 兼容接口：aihubmix、OpenRouter、Ollama(/v1)、vLLM 等都能用 */
@@ -56,20 +73,25 @@ export class OpenAICompatibleProvider implements Provider {
       model: req.model,
       messages: req.messages,
       temperature: req.temperature ?? 0.8,
-      max_tokens: req.maxTokens ?? 600,
+      max_tokens: req.maxTokens ?? 400,
     };
     if (req.json) body.response_format = { type: 'json_object' };
-    let res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal });
+    let res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout(signal, REQUEST_TIMEOUT_MS) });
     if (!res.ok && req.json && res.status === 400) {
       // 有些后端不支持 response_format，去掉重试
       delete body.response_format;
-      res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal });
+      res = await fetch(`${this.baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout(signal, REQUEST_TIMEOUT_MS) });
     }
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      throw new Error(`LLM ${res.status}: ${txt.slice(0, 300)}`);
+      const ra = Number(res.headers.get('retry-after'));
+      throw new LlmHttpError(`LLM ${res.status}: ${txt.slice(0, 300)}`, res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined);
     }
-    const data = await res.json() as {
+    // 有的服务会在 JSON 字符串里放裸换行，标准解析会失败；把控制字符换成空格再试
+    const bodyText = await res.text();
+    let parsed: unknown;
+    try { parsed = JSON.parse(bodyText); } catch { parsed = JSON.parse(bodyText.replace(/[\u0000-\u001f]/g, ' ')); }
+    const data = parsed as {
       choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
       model?: string;

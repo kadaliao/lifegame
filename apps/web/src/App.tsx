@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { DecisionPanel } from './components/DecisionPanel.js';
 import { Settings } from './components/Settings.js';
 import { Sidebar } from './components/Sidebar.js';
-import { useBranch, useStore } from './store.js';
+import { caughtUp, nowOf, useBranch, useStore } from './store.js';
 import { LifeScroll } from './views/LifeScroll.js';
 import { PeopleView } from './views/PeopleView.js';
 import { TimeRiver } from './views/TimeRiver.js';
@@ -25,6 +25,8 @@ export function App() {
   const viewTick = useStore((s) => s.viewTick);
   const setViewTick = useStore((s) => s.setViewTick);
   const usage = useStore((s) => s.usage);
+  const queue = useStore((s) => s.queue);
+  const thinking = useStore((s) => s.thinking);
   const errors = useStore((s) => s.errors);
   const dismiss = useStore((s) => s.dismissError);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
@@ -52,10 +54,12 @@ export function App() {
   if (!branch || !config) return <div className="boot">世界正在成形…</div>;
   const s = branch.summary;
   const maxTick = (config.endYear - config.startYear) * 12;
-  const nowTick = s?.tick ?? 0;
-  const shown = viewTick ?? nowTick;
+  const simTick = s?.tick ?? 0;
+  const nowTick = nowOf(branch);
+  const shown = Math.min(viewTick ?? nowTick, nowTick);
+  const atEnd = branch.finished && nowTick >= simTick;
   const year = config.startYear + Math.floor(shown / 12);
-  const counts = viewTick === undefined || !s ? { alive: s?.alive ?? 0, dead: s?.dead ?? 0 } : countAt(branch.bots, shown);
+  const counts = shown >= simTick && s ? { alive: s.alive, dead: s.dead } : countAt(branch.bots, shown);
   const month = (shown % 12) + 1;
 
   return (
@@ -70,9 +74,14 @@ export function App() {
           <b>{year}</b><span className="muted">年{month}月</span>
           {s && <span className="muted"> · 在世 {counts.alive} · 离世 {counts.dead}</span>}
           {branch.info.id !== 'main' && <span className="hero-tag">{branch.info.label}</span>}
+          {caughtUp(branch) && Object.keys(thinking).length > 0 && (
+            <span className="waiting" title="画面追上了模拟，世界在等这些人拿主意">
+              ✦ {Object.keys(thinking).map((id) => branch.bots[id]?.name).filter(Boolean).slice(0, 3).join('、')}{Object.keys(thinking).length > 3 ? ` 等${Object.keys(thinking).length}人` : ''}在想…
+            </span>
+          )}
         </div>
         <div className="controls">
-          {playing ? <button onClick={pause}>⏸ 暂停</button> : <button className="primary" onClick={play} disabled={branch.finished}>{branch.finished ? '已到尽头' : nowTick === 0 ? '▶ 开始' : '▶ 继续'}</button>}
+          {playing ? <button onClick={pause}>⏸ 暂停</button> : <button className="primary" onClick={play} disabled={atEnd}>{atEnd ? '已到尽头' : nowTick === 0 ? '▶ 开始' : '▶ 继续'}</button>}
           <div className="seg">
             {SPEEDS.map(([v, l]) => <button key={l} className={speed === v ? 'on' : ''} onClick={() => setSpeed(v)}>{l}</button>)}
           </div>
@@ -80,7 +89,7 @@ export function App() {
           <span className="muted small">{Math.round((nowTick / maxTick) * 100)}%</span>
         </div>
         <div className="right">
-          {usage && <span className="muted small" title={Object.entries(usage.byModel).map(([k, v]) => `${k}: ${v.calls} 次`).join('\n')}>模型 {usage.calls} 次 · {fmtTokens(usage.input + usage.output)} tokens{usage.cacheHits ? ` · 缓存 ${usage.cacheHits}` : ''}</span>}
+          {usage && <span className="muted small" title={Object.entries(usage.byModel).map(([k, v]) => `${k}: ${v.calls} 次`).join('\n')}>模型 {usage.calls} 次 · {fmtTokens(usage.input + usage.output)} tokens{usage.cacheHits ? ` · 缓存 ${usage.cacheHits}` : ''}{queue > 0 ? ` · 排队 ${queue}` : ''}{usage.errors ? ` · 重试 ${usage.errors}` : ''}</span>}
           <button className="ghost" onClick={restart} title="同样的设置重开">↺ 重开</button>
           <button className="ghost" onClick={() => setSettingsOpen(true)}>⚙ 设置</button>
         </div>

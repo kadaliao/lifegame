@@ -8,7 +8,8 @@
     "test": "vitest run",
     "dev": "pnpm --filter @lifegame/web dev",
     "cli": "pnpm --filter @lifegame/cli start",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "cli:live": "pnpm --filter @lifegame/cli live"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

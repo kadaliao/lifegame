@@ -1,22 +1,23 @@
 import { describe, expect, it } from 'vitest';
+import type { DecisionNode } from '@lifegame/schema';
 import { World } from './engine.js';
 import { chinaModern } from '../../eras/src/index.js';
 
 const cfg = { seed: 7, eraId: 'china-modern', population: 60, startYear: 1980, endYear: 2040, birthSpan: 10 };
 
-/** 驱动层契约：每次 step 后循环解决 pending 直到为空（决策可能连锁产生新决策） */
-function drain(w: World, pick: (d: ReturnType<World['step']>['pending'][number]) => string, by: 'user' | 'llm' = 'user', onEach?: (id: string) => void) {
-  while (w.pending.length) {
-    const d = w.pending[0];
-    onEach?.(d.id);
+/** 驱动层：把所有还没答案的决策答掉 */
+function answerAll(w: World, pick: (d: DecisionNode) => string, by: 'user' | 'llm' = 'llm', onEach?: (d: DecisionNode) => void) {
+  for (const d of w.pending) {
+    onEach?.(d);
     w.resolveDecision(d.id, pick(d), by, by === 'llm' ? 'm' : undefined);
   }
 }
 
-function runAll(w: World) {
-  while (!w.finished) {
+function runAll(w: World, pick: (d: DecisionNode) => string = (d) => d.options[0].id, onEach?: (d: DecisionNode) => void) {
+  let guard = 0;
+  while (!w.finished && guard++ < 10_000) {
     w.step();
-    drain(w, (d) => d.options[0].id);
+    answerAll(w, pick, 'llm', onEach);
   }
 }
 
@@ -38,60 +39,89 @@ describe('World', () => {
     expect(JSON.stringify(a.state.log)).not.toBe(JSON.stringify(b.state.log));
   });
 
-  it('智能 bot 的决策会挂起，解决后继续', () => {
+  it('犹豫期里世界照常前进，到期还没答案才停下', () => {
     const w = World.create(chinaModern, cfg);
     const hero = w.state.botOrder[0];
-    w.setIntelligence(hero, 'llm', 'mock');
-    let pendingSeen = 0;
-    while (!w.finished) {
-      w.step();
-      drain(w, (d) => { expect(d.botId).toBe(hero); pendingSeen++; return d.options[d.options.length - 1].id; }, 'llm');
+    w.setIntelligence(hero, 'llm');
+    let first: DecisionNode | undefined;
+    while (!first && !w.finished) {
+      const r = w.step();
+      first = r.pending[0];
     }
-    expect(pendingSeen).toBeGreaterThan(2);
-    expect(() => {
-      const w2 = World.create(chinaModern, cfg);
-      w2.setIntelligence(hero, 'llm');
-      while (true) {
-        const r = w2.step();
-        if (r.pending.length) { w2.step(); break; }
-        if (r.finished) break;
+    expect(first).toBeDefined();
+    expect(first!.botId).toBe(hero);
+    expect(first!.dueTick).toBeGreaterThan(first!.tick);
+    // 不答复也能前进到到期之前
+    while (w.tick < first!.dueTick) expect(w.step().blocked).toHaveLength(0);
+    // 到期了：停住，tick 不变
+    const before = w.tick;
+    const r = w.step();
+    expect(r.blocked.map((n) => n.id)).toContain(first!.id);
+    expect(w.tick).toBe(before);
+    // 答复后继续，并在到期时落地
+    w.resolveDecision(first!.id, first!.options[first!.options.length - 1].id, 'llm', '想好了');
+    w.step();
+    expect(w.tick).toBe(before + 1);
+    expect(w.state.decisions[first!.id].applied).toBe(true);
+    expect(w.state.log.some((e) => e.decisionId === first!.id)).toBe(true);
+  });
+
+  it('答复的快慢不影响结果：同样的答案得到同样的世界', () => {
+    const run = (eager: boolean) => {
+      const w = World.create(chinaModern, cfg);
+      for (const id of w.state.botOrder.slice(0, 5)) w.setIntelligence(id, 'llm');
+      let guard = 0;
+      while (!w.finished && guard++ < 10_000) {
+        const r = w.step();
+        // eager：一出现就答；lazy：拖到被挡住才答
+        if (eager || r.blocked.length) answerAll(w, (d) => d.options[d.options.length - 1].id);
       }
-    }).toThrow();
+      return JSON.stringify(w.state.log);
+    };
+    expect(run(true)).toBe(run(false));
   });
 
   it('分叉：改选一个决策后，分叉前的历史一致，之后分歧，原分支不受影响', () => {
     const w = World.create(chinaModern, cfg);
     const hero = w.state.botOrder[0];
     w.setIntelligence(hero, 'llm');
-    const chosen: string[] = [];
-    while (!w.finished) {
-      w.step();
-      drain(w, (d) => d.options[0].id, 'llm', (id) => chosen.push(id));
-    }
+    const asked: string[] = [];
+    runAll(w, (d) => d.options[0].id, (d) => asked.push(d.id));
     const before = JSON.stringify(w.state.log);
-    const target = w.state.decisions[chosen[1]];
-    expect(target.options.length).toBeGreaterThan(1);
+    const target = asked.map((id) => w.state.decisions[id]).find((d) => d.options.length > 1)!;
     const alt = target.options[1].id;
     const child = w.fork(target.id, alt, 'alt');
     expect(JSON.stringify(w.state.log)).toBe(before);
-    const forkedNode = child.state.decisions[target.id];
-    expect(forkedNode.chosen).toBe(alt);
-    expect(forkedNode.resolvedBy).toBe('user');
-    // 决策之前的日志前缀一致
+    expect(child.state.decisions[target.id].chosen).toBe(alt);
+    expect(child.state.decisions[target.id].resolvedBy).toBe('user');
+    // 改选落地之前的日志一致
     const prefixLen = w.state.log.findIndex((e) => e.decisionId === target.id);
     expect(prefixLen).toBeGreaterThan(0);
+    runAll(child);
     const pa = w.state.log.slice(0, prefixLen).map((e) => e.text).join('|');
     const pb = child.state.log.slice(0, prefixLen).map((e) => e.text).join('|');
     expect(pb).toBe(pa);
-    // 分叉后，改选引发的连锁决策会挂起，交给驱动层
-    drain(child, (d) => d.options[0].id, 'llm');
-    while (!child.finished) {
-      child.step();
-      drain(child, (d) => d.options[0].id, 'llm');
-    }
     expect(JSON.stringify(child.state.log)).not.toBe(before);
     expect(child.state.branchId).toBe('alt');
     expect(child.state.parentBranchId).toBe('main');
+  });
+
+  it('回退：画面之前的历史原样保留，被改设定的人之后重新做决定', () => {
+    const w = World.create(chinaModern, { ...cfg, population: 120 });
+    runAll(w);
+    // 挑一个 2000 年之后才有决策的人，在 2000 年给他赋予智能
+    const at = (2000 - 1980) * 12;
+    const later = Object.values(w.state.decisions).filter((d) => d.tick >= at + 12);
+    const botId = later[0].botId;
+    const r = w.rewind(at, botId);
+    r.setIntelligence(botId, 'llm');
+    const asked: DecisionNode[] = [];
+    runAll(r, (d) => d.options[0].id, (d) => asked.push(d));
+    expect(asked.some((d) => d.botId === botId && d.tick >= at)).toBe(true);
+    expect(asked.every((d) => d.botId === botId)).toBe(true);
+    // 回退点之前的日志一致
+    const cut = w.state.log.findIndex((e) => e.tick >= at);
+    expect(r.state.log.slice(0, cut).map((e) => e.text)).toEqual(w.state.log.slice(0, cut).map((e) => e.text));
   });
 
   it('序列化后恢复可继续运行且结果一致', () => {
@@ -103,4 +133,14 @@ describe('World', () => {
     runAll(b);
     expect(JSON.stringify(a.state.log)).toBe(JSON.stringify(b.state.log));
   });
+
+  it('每个决策都随机选，冷门路径也不崩溃', () => {
+    for (const seed of [1, 2, 3, 4]) {
+      const w = World.create(chinaModern, { ...cfg, seed, population: 200, endYear: 2060 });
+      for (const id of w.state.botOrder.slice(0, 60)) w.setIntelligence(id, 'llm');
+      let n = 0;
+      runAll(w, (d) => d.options[(seed * 7919 + n++) % d.options.length].id);
+      expect(w.state.log.length).toBeGreaterThan(500);
+    }
+  }, 30_000);
 });

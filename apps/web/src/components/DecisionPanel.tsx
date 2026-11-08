@@ -1,11 +1,11 @@
-import { useStore } from '../store.js';
+import { nowOf, useStore } from '../store.js';
 
 export function DecisionPanel() {
   const pending = useStore((s) => s.pendingUser);
   const resolve = useStore((s) => s.resolveUser);
   const ask = useStore((s) => s.askBrain);
   const branch = useStore((s) => (pending ? s.branches[pending.branchId] : undefined));
-  if (!pending || !branch) return null;
+  if (!pending || !branch || nowOf(branch) < pending.node.tick) return null;
   const bot = branch.bots[pending.node.botId];
   return (
     <div className="decision-panel">
