@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { DecisionPanel } from './components/DecisionPanel.js';
+import { RebornPanel } from './components/RebornPanel.js';
 import { SavesPanel } from './components/SavesPanel.js';
 import { Settings } from './components/Settings.js';
 import { Sidebar } from './components/Sidebar.js';
@@ -118,6 +119,7 @@ export function App() {
       <DecisionPanel />
       <Settings />
       <SavesPanel />
+      <RebornPanel />
       {notice && <div className="notice">{notice}</div>}
       {errors.length > 0 && (
         <div className="toasts">

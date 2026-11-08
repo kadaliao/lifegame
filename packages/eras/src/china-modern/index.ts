@@ -1,7 +1,7 @@
 import type { EraContext, EraPack } from '@lifegame/core';
 import type { Bot, LifeStage } from '@lifegame/schema';
-import { EDU_LABEL, createChildBot, createInitialBot, personaCard } from './bots.js';
-import { REGION_NAME, TIMELINE, wageIndex } from './data.js';
+import { EDU_LABEL, createChildBot, createCustomBot, createInitialBot, personaCard } from './bots.js';
+import { PARENT_JOBS, PLACES, REGION_NAME, TIMELINE, wageIndex } from './data.js';
 import { checkDischarge, decisions, es, initEraState, onBirthday, onTick, onYear } from './life.js';
 
 function money(n: number): string {
@@ -33,6 +33,13 @@ export const chinaModern: EraPack = {
 
   createInitialBot: (ctx, birthTick) => createInitialBot(ctx, birthTick, ctx.world.config.startYear),
   createChildBot: (ctx, mother, father, birthTick, sex) => createChildBot(ctx, mother, father, birthTick, sex, ctx.world.config.startYear),
+  createCustomBot: (ctx, spec, birthTick, id) => createCustomBot(ctx, spec, birthTick, id, ctx.world.config.startYear),
+  birthOptions: () => ({
+    regions: (['rural', 'town', 'city', 'metro'] as const).map((id) => ({ id, label: REGION_NAME[id] })),
+    places: PLACES.map((p) => ({ name: p.name, region: p.region })),
+    parentJobs: PARENT_JOBS,
+    sesLabels: ['赤贫', '贫寒', '普通', '小康', '富裕'],
+  }),
 
   onYear,
   onTick(bot, ctx) {

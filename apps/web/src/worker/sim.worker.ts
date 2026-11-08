@@ -105,11 +105,16 @@ function handle(msg: MainToWorker): void {
       return;
     }
     case 'getBot': {
+      // 按画面所在时刻取：模拟可能已经跑到十几年后，不能剧透
       const br = branches.get(msg.branchId);
-      const bot = br ? world(br).bot(msg.botId) : undefined;
-      if (br && bot) {
-        const decisions = Object.values(world(br).state.decisions).filter((d) => d.botId === bot.id && d.applied && d.kind !== '__reflect');
-        post({ type: 'bot', branchId: br.info.id, bot, samples: br.samples.get(bot.id) ?? [], decisions });
+      if (!br) return;
+      const w = world(br);
+      const at = msg.atTick ?? w.tick;
+      const bot = w.botAt(msg.botId, at);
+      if (bot) {
+        const decisions = Object.values(w.state.decisions).filter((d) => d.botId === bot.id && d.applied && d.kind !== '__reflect' && d.dueTick <= at);
+        const samples = (br.samples.get(bot.id) ?? []).filter((x) => x.tick <= at);
+        post({ type: 'bot', branchId: br.info.id, bot, samples, decisions });
       }
       return;
     }
@@ -118,6 +123,7 @@ function handle(msg: MainToWorker): void {
       return;
     }
     case 'load': return load(msg.file, msg.brain);
+    case 'reborn': return reborn(msg.spec, msg.birthTick, msg.label);
     case 'setActiveBranch': {
       if (branches.has(msg.branchId)) {
         activeId = msg.branchId;
@@ -161,8 +167,10 @@ function makeBranch(info: BranchInfo, w: World, samples = new Map<string, StatSa
       // 继承了智能的新生儿：写一句命运旁白（只用于展示）
       if ((brainSettings?.level ?? 0) >= 2 && brain) {
         for (const e of events) {
-          if (e.type !== 'child' || !e.relatedIds?.[1]) continue;
-          const child = w.bot(e.relatedIds[1]);
+          // 继承智能的孩子，或投胎进来的人
+          const childId = e.type === 'child' ? e.relatedIds?.[1] : e.type === 'birth' && e.botId?.startsWith('u') ? e.botId : undefined;
+          if (!childId) continue;
+          const child = w.bot(childId);
           if (child?.intelligence === 'llm' && !child.portrait) brain.portrait(w, child).then((p) => { child.portrait = p; }).catch(() => undefined);
         }
       }
@@ -308,7 +316,7 @@ function makeSave(): SaveFile {
     const display = Math.max(0, Math.min(displayAt.get(br.info.id) ?? 0, br.director.frontier));
     const portraits: Record<string, string> = {};
     for (const b of Object.values(w.state.bots)) if (b.portrait) portraits[b.id] = b.portrait;
-    return { info: br.info, display, intelChanges: w.state.intelChanges, answers: w.exportAnswers(display), portraits };
+    return { info: br.info, display, intelChanges: w.state.intelChanges, births: w.state.births, answers: w.exportAnswers(display), portraits };
   });
   const active = branches.get(activeId) ?? main;
   const display = saved.find((b) => b.info.id === active.info.id)?.display ?? 0;
@@ -337,8 +345,9 @@ function load(file: SaveFile, settings: BrainSettings): void {
   const era = getEra(file.config.eraId);
   for (const sb of file.branches) {
     const samples = new Map<string, StatSample[]>();
-    const w = World.replay(era, { config: file.config, flags: file.flags, intelChanges: sb.intelChanges, answers: sb.answers }, sb.display, (x) => {
-      if (x.tick % 12 === 0) sampleInto(samples, x);
+    const years: Record<number, BotSummary[]> = {};
+    const w = World.replay(era, { config: file.config, flags: file.flags, intelChanges: sb.intelChanges, births: sb.births, answers: sb.answers }, sb.display, (x) => {
+      if (x.tick % 12 === 0) { sampleInto(samples, x); years[x.tick] = allSummaries(x); }
     });
     for (const [id, p] of Object.entries(sb.portraits)) { const b = w.bot(id); if (b) b.portrait = p; }
     const br = makeBranch(sb.info, w, samples);
@@ -356,12 +365,44 @@ function load(file: SaveFile, settings: BrainSettings): void {
     const frames: Record<number, Record<string, number>> = {};
     for (const [id, arr] of samples) for (const smp of arr) (frames[smp.tick] ??= {})[id] = smp.netWorth;
     post({ type: 'frames', branchId: sb.info.id, frames });
+    post({ type: 'yearBots', branchId: sb.info.id, years });
     flush(br, w.state.log, true);
   }
   activeId = branches.has(file.active) ? file.active : file.branches[0].info.id;
   const display = displayAt.get(activeId) ?? 0;
   post({ type: 'loaded', active: activeId, compare: file.compare && branches.has(file.compare) ? file.compare : undefined, year: file.config.startYear + Math.floor(display / 12) });
   void loop();
+  wake();
+}
+
+// ---------- 投胎 ----------
+
+/** 投胎：从画面所在位置（出生在过去则从出生那个月）开一条新分支，放进这个人 */
+function reborn(spec: Parameters<World['addBirth']>[0], birthTick: number, label: string): void {
+  const parent = branches.get(activeId);
+  if (!parent) return;
+  const pw = world(parent);
+  const display = displayAt.get(parent.info.id) ?? 0;
+  const id = `reborn-${branches.size}`;
+  let made: ReturnType<World['withBirth']>;
+  try {
+    made = pw.withBirth(spec, birthTick, display + 1, id);
+  } catch (err) {
+    post({ type: 'error', message: `投胎失败：${String(err)}` });
+    return;
+  }
+  const { world: w, botId, fromSeq } = made;
+  const at = w.tick;
+  const samples = new Map<string, StatSample[]>();
+  for (const [k, v] of parent.samples) samples.set(k, v.filter((s) => s.tick <= at));
+  const info: BranchInfo = { id, parentId: parent.info.id, forkedAtTick: at, label };
+  const br = makeBranch(info, w, samples);
+  branches.set(id, br);
+  activeId = id;
+  displayAt.set(id, at);
+  post({ type: 'branch', branch: info, fromSeq, display: at });
+  flush(br, w.state.log.slice(fromSeq), true);
+  post({ type: 'reborn', branchId: id, botId, birthTick: Math.max(birthTick, at) });
   wake();
 }
 

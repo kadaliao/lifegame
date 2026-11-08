@@ -1,5 +1,5 @@
 import { clamp, type EraContext, type Rng } from '@lifegame/core';
-import type { Bot, Origin, Personality, Region, Sex, Talents, Values } from '@lifegame/schema';
+import type { BirthSpec, Bot, Origin, Personality, Region, Sex, Talents, Values } from '@lifegame/schema';
 import { PARENT_JOBS, PLACES, REGION_NAME } from './data.js';
 import { fullName, surname } from './names.js';
 
@@ -100,6 +100,35 @@ export function createInitialBot(ctx: EraContext, birthTick: number, startYear: 
   });
 }
 
+/** 投胎：按用户的设计造人，没填的按常理随机。只用由编号派生的随机数，不扰动任何人 */
+export function createCustomBot(ctx: EraContext, spec: BirthSpec, birthTick: number, id: string, startYear: number): Bot {
+  const rng = ctx.keyedRng(`birth:${id}`);
+  const year = startYear + Math.floor(birthTick / 12);
+  const place = (spec.hometown && PLACES.find((p) => p.name === spec.hometown)) || rng.pick(PLACES.filter((p) => p.region === spec.region));
+  const region = place.region;
+  const ses = clamp(Math.round(spec.ses), 1, 5);
+  const jobs = PARENT_JOBS[region];
+  const origin: Origin = {
+    ses, region, hometown: place.name,
+    fatherJob: spec.fatherJob?.trim() || rng.pick(jobs),
+    motherJob: spec.motherJob?.trim() || (rng.chance(region === 'rural' ? 0.8 : 0.4) ? (region === 'rural' ? '农民' : '家庭主妇') : rng.pick(jobs)),
+  };
+  const fix = <T extends object>(base: T, over?: Partial<T>): T => {
+    const out = { ...base };
+    for (const [k, v] of Object.entries(over ?? {})) if (typeof v === 'number') (out as Record<string, number>)[k] = clamp(Math.round(v), 1, 99);
+    return out;
+  };
+  const personality = fix(rollPersonality(rng), spec.personality);
+  const talents = fix(rollTalents(rng, ses), spec.talents);
+  const values = fix(rollValues(rng, personality, origin), spec.values);
+  const bot = newBotBase(ctx, {
+    id, name: spec.name?.trim() || fullName(rng, spec.sex, year), sex: spec.sex, birthTick,
+    familyId: `f_${id}`, parentIds: [], generation: 0, origin, personality, talents, values,
+  });
+  if (spec.bio?.trim()) bot.bio = spec.bio.trim().slice(0, 400);
+  return bot;
+}
+
 export function createChildBot(ctx: EraContext, mother: Bot, father: Bot, birthTick: number, sex: Sex, startYear: number): Bot {
   const rng = ctx.rng;
   const year = startYear + Math.floor(birthTick / 12);
@@ -191,6 +220,7 @@ export function personaCard(bot: Bot, startYear: number): string {
   const tw = talentWords(bot.talents);
   if (tw.length) lines.push(`天赋：${tw.join('，')}。`);
   lines.push(`最看重：${topValues(bot.values).join('、')}。`);
+  if (bot.bio) lines.push(`身世：${bot.bio}`);
   // 命运旁白只用于展示，不进提示词：它是异步生成的，进了提示词会让答案依赖网络快慢
   return lines.join('\n');
 }

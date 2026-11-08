@@ -15,6 +15,7 @@ export function Sidebar({ branch }: { branch: BranchData }) {
   const setCompare = useStore((s) => s.setCompareBranch);
   const startYear = useStore((s) => s.config?.startYear ?? 1980);
   const [q, setQ] = useState('');
+  const setRebornOpen = useStore((s) => s.setRebornOpen);
   const viewTick = useStore((s) => s.viewTick);
   const now = nowOf(branch);
   const tick = Math.min(viewTick ?? now, now);
@@ -42,6 +43,7 @@ export function Sidebar({ branch }: { branch: BranchData }) {
   const list = Object.values(branches);
   return (
     <aside className="sidebar">
+      <button className="reborn-btn" onClick={() => setRebornOpen(true)} title="设计一个人，投进这个世界活一遍">＋ 投胎</button>
       {list.length > 1 && (
         <section>
           <h4>分支</h4>

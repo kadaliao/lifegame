@@ -159,4 +159,29 @@ describe('World', () => {
     expect(lifeOf(w, hero)).not.toBe(lifeOf(child, hero));
     expect(same / others.length).toBeGreaterThan(0.85);
   });
+
+  it('投胎：新分支里多出这个人，退回点之前的历史不变，重放与存档都能还原', () => {
+    const w = World.create(chinaModern, { ...cfg, population: 80 });
+    w.setFlags({ inherit: true });
+    for (const id of w.state.botOrder.slice(0, 3)) w.setIntelligence(id, 'llm');
+    runAll(w);
+    const spec = { name: '林小满', sex: 'female' as const, region: 'rural' as const, hometown: '甘肃定西某村', ses: 1, bio: '母亲早逝，跟着奶奶长大，喜欢画画。', intelligence: 'llm' as const, model: 'mock/mock', personality: { openness: 90, neuroticism: 20 } };
+    const at = (1990 - 1980) * 12;
+    const { world: b, botId } = w.withBirth(spec, at + 3, at, 'reborn');
+    const before = (x: World) => x.state.log.filter((e) => e.tick < at).map((e) => e.text);
+    expect(before(b)).toEqual(before(w));
+    runAll(b);
+    const kid = b.bot(botId)!;
+    expect(kid.name).toBe('林小满');
+    expect(kid.origin.hometown).toBe('甘肃定西某村');
+    expect(kid.personality.openness).toBe(90);
+    expect(kid.intelligence).toBe('llm');
+    expect(kid.lead).toBe(true);
+    expect(kid.birthTick).toBe(at + 3);
+    expect(b.state.log.some((e) => e.botId === botId && e.type === 'decision')).toBe(true);
+    // 存档重放：同样的配置、时间线、出生名单与答案
+    const r = World.replay(chinaModern, { config: b.state.config, flags: b.state.flags, intelChanges: b.state.intelChanges, births: b.state.births, answers: b.exportAnswers(b.tick) }, b.tick);
+    runAll(r);
+    expect(r.state.log.map((e) => e.text)).toEqual(b.state.log.map((e) => e.text));
+  });
 });

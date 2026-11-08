@@ -98,10 +98,32 @@ export interface Reflection {
   text: string;
 }
 
+/** 投胎：用户自己设计的人。没填的项由时代包按常理随机补上 */
+export interface BirthSpec {
+  name?: string;
+  sex: Sex;
+  region: Region;
+  hometown?: string;
+  /** 家境 1(赤贫)~5(富裕) */
+  ses: number;
+  fatherJob?: string;
+  motherJob?: string;
+  personality?: Partial<Personality>;
+  talents?: Partial<Talents>;
+  values?: Partial<Values>;
+  /** 身世与自述，写进模型看到的人格卡 */
+  bio?: string;
+  intelligence: IntelligenceMode;
+  model?: string;
+  lead?: boolean;
+}
+
 export interface Bot {
   id: string;
   name: string;
   sex: Sex;
+  /** 用户写的身世（投胎时填） */
+  bio?: string;
   birthTick: number;
   deathTick?: number;
   deathCause?: string;

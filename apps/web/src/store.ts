@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { BotSummary } from '@lifegame/core';
 import { DEFAULT_PROVIDERS, type ProviderConfig, type UsageRecord } from '@lifegame/llm';
-import type { Bot, DecisionNode, WorldConfig, WorldEvent, WorldSummary } from '@lifegame/schema';
+import type { BirthSpec, Bot, DecisionNode, WorldConfig, WorldEvent, WorldSummary } from '@lifegame/schema';
 import type { BranchInfo, BrainSettings, MainToWorker, SaveFile, StatSample, WorkerToMain } from './protocol.js';
 import { AUTOSAVE_ID, deleteSave, downloadSave, getSave, isSaveFile, listSaves, putSave, type SaveMeta } from './saves.js';
 
@@ -28,6 +28,35 @@ export interface BranchData {
   epoch: number;
   /** 画面最多能播到的 tick：不越过任何还没被真答案确认的推测 */
   frontier: number;
+  /** 逐年的人物摘要（模拟领先画面，界面要按画面所在年份取，不能剧透） */
+  yearBots: Record<number, BotSummary[]>;
+  /** 模拟最新的人物摘要 */
+  latest?: { tick: number; bots: BotSummary[] };
+  /** bots 当前取自哪个时刻的摘要 */
+  botsKey: number;
+}
+
+/** 画面（或回看）所在时刻的人物摘要 */
+function pickBots(br: BranchData, at: number): { key: number; list: BotSummary[] } | undefined {
+  if (br.latest && at >= br.latest.tick - 1) return { key: br.latest.tick, list: br.latest.bots };
+  let best = -1;
+  for (const k in br.yearBots) { const n = Number(k); if (n <= at && n > best) best = n; }
+  if (best >= 0) return { key: best, list: br.yearBots[best] };
+  return br.latest ? { key: br.latest.tick, list: br.latest.bots } : undefined;
+}
+
+function withBotsAt(br: BranchData, at: number): BranchData {
+  const p = pickBots(br, at);
+  if (!p || p.key === br.botsKey) return br;
+  const bots: Record<string, BotSummary> = {};
+  for (const b of p.list) bots[b.id] = b;
+  return { ...br, bots, botOrder: p.list.map((b) => b.id), botsKey: p.key };
+}
+
+/** 画面上此刻显示的时刻（回看时是回看的时刻） */
+export function shownOf(br: BranchData, viewTick?: number): number {
+  const now = nowOf(br);
+  return Math.min(viewTick ?? now, now);
 }
 
 /** 只保留出现在事件里的决策卡片 */
@@ -91,6 +120,9 @@ interface State {
   world: WorldSettings;
   settingsOpen: boolean;
   savesOpen: boolean;
+  rebornOpen: boolean;
+  /** 投胎后要亲自掌控的人 */
+  rebornControl?: string;
   saves: SaveMeta[];
   /** 一闪而过的提示 */
   notice?: string;
@@ -117,6 +149,8 @@ interface State {
   dismissError(i: number): void;
   setIntelligence(botId: string, mode: 'rules' | 'llm', model?: string): void;
   setSavesOpen(v: boolean): void;
+  setRebornOpen(v: boolean): void;
+  reborn(spec: BirthSpec, birthYear: number, control: boolean): void;
   refreshSaves(): Promise<void>;
   saveWorld(name: string, id?: string): Promise<void>;
   loadSave(id: string): Promise<void>;
@@ -176,6 +210,7 @@ export const useStore = create<State>((set, get) => ({
   world: loadWorld(),
   settingsOpen: false,
   savesOpen: false,
+  rebornOpen: false,
   saves: [],
   loading: false,
 
@@ -227,14 +262,22 @@ export const useStore = create<State>((set, get) => ({
   play() { set({ playing: true, viewTick: undefined }); },
   pause() { set({ playing: false }); },
   setSpeed(s) { set({ speed: s }); },
-  setViewTick(t) { set({ viewTick: t }); },
+  setViewTick(t) {
+    set((s) => {
+      const br = s.branches[s.activeBranch];
+      if (!br) return { viewTick: t };
+      return { viewTick: t, branches: { ...s.branches, [s.activeBranch]: withBotsAt(br, shownOf(br, t)) } };
+    });
+    const sel = get().selectedBot;
+    if (sel) askBot(get, get().activeBranch, sel);
+  },
 
   selectBot(id) {
     set({ selectedBot: id, botDetail: undefined, compareDetail: undefined });
     if (id) {
       const { activeBranch, compareBranch } = get();
-      get().send({ type: 'getBot', branchId: activeBranch, botId: id });
-      if (compareBranch) get().send({ type: 'getBot', branchId: compareBranch, botId: id });
+      askBot(get, activeBranch, id);
+      if (compareBranch) askBot(get, compareBranch, id);
     }
   },
 
@@ -262,13 +305,13 @@ export const useStore = create<State>((set, get) => ({
     set({ activeBranch: id, viewTick: undefined });
     get().send({ type: 'setActiveBranch', branchId: id });
     const sel = get().selectedBot;
-    if (sel) get().send({ type: 'getBot', branchId: id, botId: sel });
+    if (sel) askBot(get, id, sel);
   },
 
   setCompareBranch(id) {
     set({ compareBranch: id, compareDetail: undefined });
     const sel = get().selectedBot;
-    if (id && sel) get().send({ type: 'getBot', branchId: id, botId: sel });
+    if (id && sel) askBot(get, id, sel);
   },
 
   setBrain(b) {
@@ -286,6 +329,19 @@ export const useStore = create<State>((set, get) => ({
   setSettingsOpen(v) { set({ settingsOpen: v }); },
   dismissError(i) { set((s) => ({ errors: s.errors.filter((_, j) => j !== i) })); },
   setIntelligence(botId, mode, model) { get().send({ type: 'setIntelligence', botId, mode, model }); },
+
+  setRebornOpen(v) { set({ rebornOpen: v }); },
+
+  reborn(spec, birthYear, control) {
+    const cfg = get().config;
+    if (!cfg) return;
+    // 出生月份随机，记进出生名单后就固定了
+    const birthTick = (birthYear - cfg.startYear) * 12 + Math.floor(Math.random() * 12);
+    const who = spec.name?.trim() || `${birthYear}年生的${spec.sex === 'male' ? '男孩' : '女孩'}`;
+    set({ rebornOpen: false, playing: false, rebornControl: control ? '?' : undefined, userControl: null });
+    get().send({ type: 'setUserControl', botId: null });
+    get().send({ type: 'reborn', spec, birthTick, label: `投胎：${who}` });
+  },
 
   setSavesOpen(v) {
     set({ savesOpen: v });
@@ -385,7 +441,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       for (const b of m.bots) bots[b.id] = b;
       set({
         config: m.config, era: m.era,
-        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: m.display ? {} : { 0: frameOf(m.bots, 0) }, displayTick: m.display ?? 0, epoch: 0, frontier: m.display ?? 0 } },
+        branches: { [m.branch.id]: { info: m.branch, events: [], bots, botOrder: m.bots.map((b) => b.id), finished: false, decided: {}, frames: m.display ? {} : { 0: frameOf(m.bots, 0) }, displayTick: m.display ?? 0, epoch: 0, frontier: m.display ?? 0, yearBots: m.display ? {} : { 0: m.bots }, latest: { tick: m.display ?? 0, bots: m.bots }, botsKey: m.display ?? 0 } },
         activeBranch: m.branch.id,
       });
       const hero = m.bots.find((b) => b.intelligence === 'llm') ?? m.bots[0];
@@ -399,21 +455,14 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         const next: BranchData = { ...br, summary: m.summary, finished: m.finished, frontier: m.frontier };
         if (m.events.length) next.events = br.events.concat(m.events);
         if (m.bots) {
-          const bots: Record<string, BotSummary> = {};
-          for (const b of m.bots) bots[b.id] = b;
-          next.bots = bots;
-          next.botOrder = m.bots.map((b) => b.id);
+          next.latest = { tick: m.summary.tick, bots: m.bots };
+          next.botsKey = -1;
+          if (m.summary.tick % 12 === 0) next.yearBots = { ...br.yearBots, [m.summary.tick]: m.bots };
           next.frames = { ...br.frames, [m.summary.tick]: frameOf(m.bots, m.summary.tick) };
+          return { branches: { ...s.branches, [m.branchId]: withBotsAt(next, shownOf(next, m.branchId === s.activeBranch ? s.viewTick : undefined)) } };
         }
         return { branches: { ...s.branches, [m.branchId]: next } };
       });
-      // 选中的人每年刷新一次详情
-      if (m.bots && get().selectedBot) {
-        const sel = get().selectedBot!;
-        if (m.branchId === get().activeBranch || m.branchId === get().compareBranch) {
-          get().send({ type: 'getBot', branchId: m.branchId, botId: sel });
-        }
-      }
       break;
     }
     case 'pending': {
@@ -429,7 +478,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         if (!br) return {};
         return { branches: { ...s.branches, [m.branchId]: { ...br, decided: { ...br.decided, [m.node.id]: m.node } } } };
       });
-      if (get().selectedBot === m.node.botId) get().send({ type: 'getBot', branchId: m.branchId, botId: m.node.botId });
+      if (get().selectedBot === m.node.botId) askBot(get, m.branchId, m.node.botId);
       break;
     }
     case 'thinking': {
@@ -441,7 +490,7 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       break;
     }
     case 'reflection': {
-      if (get().selectedBot === m.botId) get().send({ type: 'getBot', branchId: m.branchId, botId: m.botId });
+      if (get().selectedBot === m.botId) askBot(get, m.branchId, m.botId);
       break;
     }
     case 'bot': {
@@ -459,7 +508,8 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         const frames: Record<number, Record<string, number>> = {};
         if (parent) for (const [k, f] of Object.entries(parent.frames)) if (Number(k) <= snapTick) frames[Number(k)] = f;
         return {
-          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: m.display ?? parent?.displayTick ?? 0, epoch: 0, frontier: m.display ?? 0 } },
+          branches: { ...s.branches, [m.branch.id]: { info: m.branch, events, bots: parent?.bots ?? {}, botOrder: parent?.botOrder ?? [], finished: false, decided, frames, displayTick: m.display ?? parent?.displayTick ?? 0, epoch: 0, frontier: m.display ?? 0,
+            yearBots: Object.fromEntries(Object.entries(parent?.yearBots ?? {}).filter(([k]) => Number(k) <= snapTick)), botsKey: -1 } },
           activeBranch: m.branch.id,
           compareBranch: m.branch.parentId,
           viewTick: undefined,
@@ -468,8 +518,8 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
       {
         const sel = get().selectedBot;
         if (sel) {
-          get().send({ type: 'getBot', branchId: m.branch.id, botId: sel });
-          if (m.branch.parentId) get().send({ type: 'getBot', branchId: m.branch.parentId, botId: sel });
+          askBot(get, m.branch.id, sel);
+          if (m.branch.parentId) askBot(get, m.branch.parentId, sel);
         }
       }
       break;
@@ -482,17 +532,38 @@ function onWorkerMessage(m: WorkerToMain, set: Set, get: Get): void {
         const frames: Record<number, Record<string, number>> = {};
         for (const [k, f] of Object.entries(br.frames)) if (Number(k) <= m.fromTick) frames[Number(k)] = f;
         const pendingUser = s.pendingUser?.branchId === m.branchId ? undefined : s.pendingUser;
-        return { pendingUser, branches: { ...s.branches, [m.branchId]: { ...br, events, decided: decidedIn(events, br.decided), frames, epoch: br.epoch + 1 } } };
+        const yearBots: Record<number, BotSummary[]> = {};
+        for (const [k, v] of Object.entries(br.yearBots)) if (Number(k) <= m.fromTick) yearBots[Number(k)] = v;
+        return { pendingUser, branches: { ...s.branches, [m.branchId]: { ...br, events, decided: decidedIn(events, br.decided), frames, yearBots, epoch: br.epoch + 1 } } };
       });
       break;
     }
     case 'usage': set({ usage: m.usage, queue: m.queue }); break;
+    case 'yearBots': {
+      set((s) => {
+        const br = s.branches[m.branchId];
+        if (!br) return {};
+        return { branches: { ...s.branches, [m.branchId]: withBotsAt({ ...br, yearBots: { ...br.yearBots, ...m.years }, botsKey: -1 }, nowOf(br)) } };
+      });
+      break;
+    }
     case 'frames': {
       set((s) => {
         const br = s.branches[m.branchId];
         if (!br) return {};
         return { branches: { ...s.branches, [m.branchId]: { ...br, frames: { ...br.frames, ...m.frames } } } };
       });
+      break;
+    }
+    case 'reborn': {
+      set({ compareBranch: undefined, viewTick: undefined });
+      get().selectBot(m.botId);
+      if (get().rebornControl) {
+        set({ rebornControl: undefined });
+        get().setUserControl(m.botId);
+      }
+      const cfg = get().config;
+      if (cfg) get().flash(`投胎到 ${cfg.startYear + Math.floor(m.birthTick / 12)} 年，按播放看 TA 的一生`);
       break;
     }
     case 'saved': {
@@ -530,7 +601,19 @@ function startClock(set: Set, get: Get): void {
         displayFloat.set(br.info.id, cur);
         const ti = Math.floor(cur);
         if (ti !== br.displayTick) {
-          set((st) => ({ branches: { ...st.branches, [br.info.id]: { ...st.branches[br.info.id], displayTick: ti } } }));
+          const prevKey = br.botsKey;
+          set((st) => {
+            const b0 = st.branches[br.info.id];
+            return { branches: { ...st.branches, [br.info.id]: withBotsAt({ ...b0, displayTick: ti }, shownOf({ ...b0, displayTick: ti }, st.viewTick)) } };
+          });
+          // 画面跨年：刷新选中人物的详情（按画面所在年份）
+          const after = get().branches[br.info.id];
+          const sel = get().selectedBot;
+          if (sel && (Math.floor(ti / 12) !== Math.floor(br.displayTick / 12) || after.botsKey !== prevKey)) {
+            askBot(get, br.info.id, sel);
+            const cmp = get().compareBranch;
+            if (cmp) askBot(get, cmp, sel);
+          }
         }
         if (br.finished && ti >= sim) set({ playing: false });
       }
@@ -545,6 +628,14 @@ function startClock(set: Set, get: Get): void {
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
+}
+
+/** 向 Worker 要某人在画面所在时刻的详情 */
+function askBot(get: Get, branchId: string, botId: string): void {
+  const s = get();
+  const br = s.branches[branchId];
+  const atTick = br ? shownOf(br, branchId === s.activeBranch ? s.viewTick : undefined) : undefined;
+  s.send({ type: 'getBot', branchId, botId, atTick });
 }
 
 async function loadEnvProviders(): Promise<ProviderConfig[]> {

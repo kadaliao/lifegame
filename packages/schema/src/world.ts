@@ -1,4 +1,4 @@
-import type { Bot } from './bot.js';
+import type { BirthSpec, Bot } from './bot.js';
 import type { WorldEvent } from './event.js';
 import type { DecisionNode } from './decision.js';
 
@@ -12,6 +12,12 @@ export interface WorldConfig {
   endYear: number;
   /** 初始人口出生年份跨度 */
   birthSpan: number;
+}
+
+export interface CustomBirth {
+  tick: number;
+  id: string;
+  spec: BirthSpec;
 }
 
 export interface IntelChange {
@@ -64,6 +70,8 @@ export interface WorldStateShape {
   flags: WorldFlags;
   /** 智能设定的时间线：谁在哪个月起由模型/规则驱动。重放时按原来的时刻生效 */
   intelChanges: IntelChange[];
+  /** 投胎进来的人：在出生那个月由引擎创建，重放时同样出现 */
+  births: CustomBirth[];
   /** 时代包的可变全局状态 */
   eraState: Record<string, unknown>;
   nextId: number;

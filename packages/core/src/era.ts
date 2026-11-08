@@ -1,5 +1,5 @@
 import type {
-  Bot, DecisionNode, DecisionOption, LifeStage, WorldEvent, WorldStateShape, Sex,
+  Bot, DecisionNode, DecisionOption, LifeStage, WorldEvent, WorldStateShape, Sex, BirthSpec, Region,
 } from '@lifegame/schema';
 import type { Rng } from './rng.js';
 
@@ -49,6 +49,13 @@ export interface DecisionDef {
   apply(bot: Bot, optionId: string, ctx: EraContext, node: DecisionNode): void;
 }
 
+export interface BirthOptions {
+  regions: Array<{ id: Region; label: string }>;
+  places: Array<{ name: string; region: Region }>;
+  parentJobs: Record<Region, string[]>;
+  sesLabels: string[];
+}
+
 export interface EraTheme {
   accent: string;
   paper: string;
@@ -68,6 +75,10 @@ export interface EraPack {
   stageOf(age: number): LifeStage;
   createInitialBot(ctx: EraContext, birthTick: number): Bot;
   createChildBot(ctx: EraContext, mother: Bot, father: Bot, birthTick: number, sex: Sex): Bot;
+  /** 投胎：按用户的设计造一个人。只能用 ctx.keyedRng，不能动任何人的随机数流 */
+  createCustomBot?(ctx: EraContext, spec: BirthSpec, birthTick: number, id: string): Bot;
+  /** 投胎界面的选项 */
+  birthOptions?(): BirthOptions;
   /** 每年年初（1 月）世界级钩子：历史事件、物价 */
   onYear(ctx: EraContext): void;
   /** 每月每个活着的 bot */

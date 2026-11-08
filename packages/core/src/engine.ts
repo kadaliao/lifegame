@@ -1,7 +1,7 @@
 import {
   TICKS_PER_YEAR, ageAt, tickToYearMonth,
   type Bot, type DecisionNode, type DecisionResolver, type IntelligenceMode,
-  type IntelChange, type WorldConfig, type WorldEvent, type WorldFlags, type WorldStateShape, type WorldSummary, type LifeStage,
+  type BirthSpec, type CustomBirth, type IntelChange, type WorldConfig, type WorldEvent, type WorldFlags, type WorldStateShape, type WorldSummary, type LifeStage,
 } from '@lifegame/schema';
 import { Rng } from './rng.js';
 import type { DecisionRequest, EraContext, EraPack, LogInput } from './era.js';
@@ -93,6 +93,7 @@ export class World {
       provisionalIds: [],
       flags: { reflections: false, inherit: false },
       intelChanges: [],
+      births: [],
       eraState: era.initEraState(),
       nextId: 1,
     };
@@ -238,6 +239,7 @@ export class World {
     this.ctx.year = year;
     this.ctx.month = month;
 
+    for (const b of this.state.births) if (b.tick === t && !this.state.bots[b.id]) this.createBorn(b);
     for (const c of this.state.intelChanges) if (c.tick === t) this.applyIntel(c);
     this.curRng = this.rng;
     if (month === 1) this.era.onYear(this.ctx);
@@ -397,6 +399,56 @@ export class World {
     this.applyIntel(c);
   }
 
+  /**
+   * 投胎：在 birthTick 那个月把一个自己设计的人放进世界（birthTick 不早于现在）。
+   * 记入 births 与智能时间线，重放、分叉、存档都会带着他。
+   */
+  addBirth(spec: BirthSpec, birthTick: number): string {
+    if (!this.era.createCustomBot) throw new Error(`${this.era.name}还不支持投胎`);
+    if (birthTick < this.state.tick) throw new Error('出生时间不能早于世界当前的时间');
+    const id = `u${this.state.births.length + 1}`;
+    this.state.births.push({ tick: birthTick, id, spec });
+    this.state.intelChanges.push({ tick: birthTick, botId: id, intelligence: spec.intelligence, model: spec.model, lead: spec.intelligence === 'llm' && spec.lead !== false });
+    return id;
+  }
+
+  private createBorn(b: CustomBirth): void {
+    const bot = this.era.createCustomBot!(this.ctx, b.spec, b.tick, b.id);
+    this.state.bots[bot.id] = bot;
+    this.state.botOrder.push(bot.id);
+  }
+
+  /**
+   * 投胎到一条新分支：世界退回 branchPoint（不晚于出生），重放到那一刻，再放进这个人。
+   * 退回点之前提出的已确认答案照搬；还没答复或只是推测的，留给新分支重新问。
+   */
+  withBirth(spec: BirthSpec, birthTick: number, branchPoint: number, branchId: string): { world: World; botId: string; fromSeq: number } {
+    const at = Math.max(0, Math.min(branchPoint, birthTick));
+    let snapTick = Math.floor(at / TICKS_PER_YEAR) * TICKS_PER_YEAR;
+    while (snapTick > 0 && !this.snapshots.has(snapTick)) snapTick -= TICKS_PER_YEAR;
+    const snap = this.snapshots.get(snapTick);
+    if (!snap) throw new Error(`缺少 tick ${snapTick} 的快照`);
+    const scripted: ScriptedChoices = {};
+    for (const d of Object.values(this.state.decisions)) {
+      if (d.chosen !== undefined && !d.provisional && d.tick < at) scripted[d.id] = scriptOf(d);
+    }
+    const w = World.restore(this.era, snap, this.state.log, scripted);
+    const fromSeq = w.state.log.length;
+    for (const [t, sn] of this.snapshots) if (t < snapTick) w.snapshots.set(t, sn);
+    w.state.branchId = branchId;
+    w.state.parentBranchId = this.state.branchId;
+    w.state.forkedAtTick = at;
+    w.state.flags = { ...this.state.flags };
+    w.state.intelChanges = this.state.intelChanges.map((c) => ({ ...c }));
+    w.state.births = this.state.births.map((b) => ({ ...b }));
+    while (w.tick < at && !w.finished) {
+      if (w.step().blocked.length) break;
+    }
+    w.scripted = {};
+    const botId = w.addBirth(spec, Math.max(birthTick, w.tick));
+    return { world: w, botId, fromSeq };
+  }
+
   private applyIntel(c: IntelChange): void {
     const bot = this.state.bots[c.botId];
     if (!bot) return;
@@ -421,10 +473,11 @@ export class World {
   }
 
   /** 读档：从头按原来的配置、智能时间线和答案重放到 untilTick（含） */
-  static replay(era: EraPack, save: { config: WorldConfig; flags: WorldFlags; intelChanges: IntelChange[]; answers: ScriptedChoices }, untilTick: number, onStep?: (w: World, events: WorldEvent[]) => void): World {
+  static replay(era: EraPack, save: { config: WorldConfig; flags: WorldFlags; intelChanges: IntelChange[]; births?: CustomBirth[]; answers: ScriptedChoices }, untilTick: number, onStep?: (w: World, events: WorldEvent[]) => void): World {
     const w = World.create(era, save.config);
     w.state.flags = { ...save.flags };
     w.state.intelChanges = save.intelChanges.map((c) => ({ ...c }));
+    w.state.births = (save.births ?? []).map((b) => ({ ...b }));
     w.scripted = save.answers;
     while (!w.finished && w.tick <= untilTick) {
       const r = w.step();
@@ -463,6 +516,7 @@ export class World {
     child.state.forkedAtTick = node.tick;
     child.state.flags = { ...this.state.flags };
     child.state.intelChanges = this.state.intelChanges.map((c) => ({ ...c }));
+    child.state.births = this.state.births.map((b) => ({ ...b }));
     // 重放到改选被提出的那个月，之后的世界开始分歧
     while (child.state.tick <= node.tick && !child.finished) {
       if (child.step().blocked.length) break;
@@ -493,8 +547,24 @@ export class World {
     w.state.flags = { ...this.state.flags };
     // 快照之后的设定变化在重放中按原来的时刻生效
     w.state.intelChanges = this.state.intelChanges.map((c) => ({ ...c }));
+    w.state.births = this.state.births.map((b) => ({ ...b }));
     return w;
   }
+
+  /** 某人在 atTick 时的样子：取不晚于 atTick 的那个年初快照（模拟领先画面时用，避免剧透） */
+  botAt(botId: string, atTick: number): Bot | undefined {
+    if (atTick >= this.state.tick - 1) return this.state.bots[botId];
+    let key = Math.floor(atTick / TICKS_PER_YEAR) * TICKS_PER_YEAR;
+    while (key > 0 && !this.snapshots.has(key)) key -= TICKS_PER_YEAR;
+    const snap = this.snapshots.get(key);
+    if (!snap) return this.state.bots[botId];
+    if (this.snapCache?.json !== snap.json) {
+      this.snapCache = { json: snap.json, bots: (JSON.parse(snap.json) as WorldStateShape).bots };
+    }
+    return this.snapCache.bots[botId];
+  }
+
+  private snapCache?: { json: string; bots: Record<string, Bot> };
 
   /** 回退时第一个快照所在 tick（日志从这里开始会重新生成） */
   snapshotLogLength(tick: number): number {
@@ -638,6 +708,7 @@ function normalize(state: WorldStateShape): void {
   state.provisionalIds ??= [];
   state.flags ??= { reflections: false, inherit: false };
   state.intelChanges ??= [];
+  state.births ??= [];
 }
 
 export function stageName(stage: LifeStage): string {
